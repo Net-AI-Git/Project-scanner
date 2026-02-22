@@ -1,0 +1,21 @@
+# Cursor IDE
+.cursor/
+
+# Environment (API keys — never commit)
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Task documents (local / draft)
+TASK_BREAKDOWN.md
+TASK_AI_PERFORMANCE_ENGINEERING_2026.md
