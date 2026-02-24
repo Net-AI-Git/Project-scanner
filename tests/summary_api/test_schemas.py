@@ -1,6 +1,7 @@
 """Targeted tests for summary_api.schemas: request/response models and serialization."""
 
 import pytest
+from pydantic import ValidationError
 
 from summary_api.schemas import ErrorResponse, SummarizeRequest, SummarizeResponse
 
@@ -26,10 +27,11 @@ def test_summarize_request_model_dump_has_github_url_key() -> None:
     assert keys == ["github_url"], f"Expected keys ['github_url'], got {keys}"
 
 
-def test_summarize_request_empty_string_accepted() -> None:
-    """SummarizeRequest allows empty string for github_url (validation may be added later)."""
-    req = SummarizeRequest(github_url="")
-    assert req.github_url == ""
+def test_summarize_request_empty_string_rejected() -> None:
+    """SummarizeRequest rejects empty string for github_url (edge case: returns 400 in API)."""
+    with pytest.raises(ValidationError) as exc_info:
+        SummarizeRequest(github_url="")
+    assert "github_url" in str(exc_info.value) or "non-empty" in str(exc_info.value).lower()
 
 
 def test_summarize_request_missing_github_url_raises() -> None:

@@ -10,12 +10,18 @@
 __pycache__/
 *.py[cod]
 *.pyo
+.pytest_cache/
+pytest-cache-files-*
 
 # Virtual environment
 .venv/
 venv/
 env/
 
+# Explore / local scripts (not part of main app)
+explore_github_api/
+
 # Task documents (local / draft)
 TASK_BREAKDOWN.md
 TASK_AI_PERFORMANCE_ENGINEERING_2026.md
+TASK_10_VALIDATION.md

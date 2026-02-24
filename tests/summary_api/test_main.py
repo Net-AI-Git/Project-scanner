@@ -1,4 +1,6 @@
-"""Targeted tests for summary_api.main: root and POST /summarize endpoints."""
+"""Targeted tests for summary_api.main: root and POST /summarize endpoints (real GitHub + LLM when tokens set)."""
+
+import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -6,6 +8,17 @@ from fastapi.testclient import TestClient
 from summary_api.main import app
 
 client = TestClient(app)
+
+# Real integration tests require GITHUB_TOKEN for API rate limit (5000/h). Without it they are skipped.
+def _has_github_token() -> bool:
+    return bool(os.environ.get("GITHUB_TOKEN", "").strip())
+
+
+def _has_llm_key() -> bool:
+    """True if at least one LLM API key is set (for full summarize flow)."""
+    return bool(os.environ.get("GOOGLE_API_KEY", "").strip()) or bool(
+        os.environ.get("NEBIUS_API_KEY", "").strip()
+    )
 
 
 # --- GET / ---
@@ -31,47 +44,86 @@ def test_root_returns_json_with_message_and_docs() -> None:
 # --- POST /summarize ---
 
 
-def test_summarize_happy_path_returns_200() -> None:
-    """POST /summarize with valid github_url returns 200."""
-    # Arrange
-    body = {"github_url": "https://github.com/psf/requests"}
-    # Act
-    response = client.post("/summarize", json=body)
-    # Assert
-    assert response.status_code == 200, f"Expected 200, got {response.status_code}"
-
-
-def test_summarize_returns_spec_fields() -> None:
-    """POST /summarize response has summary, technologies, structure per API spec."""
-    response = client.post("/summarize", json={"github_url": "https://github.com/a/b"})
+@pytest.mark.skipif(
+    not (_has_github_token() and _has_llm_key()),
+    reason="Set GITHUB_TOKEN and GOOGLE_API_KEY or NEBIUS_API_KEY for full flow",
+)
+def test_summarize_happy_path_real_api() -> None:
+    """POST /summarize with valid github_url: real GitHub + LLM. 200 + spec fields, or 429 (rate limit) + error body."""
+    response = client.post("/summarize", json={"github_url": "https://github.com/psf/requests"})
     data = response.json()
-    assert "summary" in data, "Response must contain 'summary'"
-    assert "technologies" in data, "Response must contain 'technologies'"
-    assert "structure" in data, "Response must contain 'structure'"
-    assert isinstance(data["technologies"], list), "technologies must be a list"
+    if response.status_code == 200:
+        assert "summary" in data, "Response must contain 'summary'"
+        assert "technologies" in data, "Response must contain 'technologies'"
+        assert "structure" in data, "Response must contain 'structure'"
+        assert isinstance(data["technologies"], list), "technologies must be a list"
+        assert isinstance(data["summary"], str) and len(data["summary"]) > 0
+        assert isinstance(data["structure"], str) and len(data["structure"]) > 0
+    elif response.status_code == 429:
+        # Rate limit is per account/key, not per test run — previous usage can exhaust quota
+        assert data.get("status") == "error" and "message" in data
+    else:
+        pytest.fail(f"Unexpected status {response.status_code}: {data}")
 
 
-def test_summarize_stub_content() -> None:
-    """POST /summarize stub returns fixed stub text in summary and structure."""
-    response = client.post("/summarize", json={"github_url": "https://github.com/x/y"})
-    data = response.json()
-    assert "Stub" in data["summary"], f"Expected stub summary, got {data['summary']!r}"
-    assert "Stub" in data["structure"], f"Expected stub structure, got {data['structure']!r}"
-
-
-def test_summarize_missing_github_url_returns_422() -> None:
-    """POST /summarize without github_url returns 422 Unprocessable Entity."""
-    # Arrange: body missing required field
+def test_summarize_missing_github_url_returns_400_and_error_body() -> None:
+    """POST /summarize without github_url returns 400 and spec error body (status, message)."""
     response = client.post("/summarize", json={})
-    # Assert
-    assert response.status_code == 422, f"Expected 422 for validation error, got {response.status_code}"
+    assert response.status_code == 400, f"Expected 400, got {response.status_code}"
+    data = response.json()
+    assert data.get("status") == "error"
+    assert "message" in data
 
 
-def test_summarize_invalid_body_not_json_returns_422() -> None:
-    """POST /summarize with non-JSON or invalid type for github_url returns 422."""
+def test_summarize_github_url_not_string_returns_400_and_error_body() -> None:
+    """POST /summarize with github_url not a string (e.g. number) returns 400 and spec error body."""
+    response = client.post("/summarize", json={"github_url": 123})
+    assert response.status_code == 400
+    data = response.json()
+    assert data.get("status") == "error"
+    assert "message" in data
+
+
+def test_summarize_github_url_empty_string_returns_400_and_error_body() -> None:
+    """POST /summarize with empty github_url returns 400 and spec error body."""
+    response = client.post("/summarize", json={"github_url": ""})
+    assert response.status_code == 400
+    data = response.json()
+    assert data.get("status") == "error"
+    assert "message" in data
+
+
+def test_summarize_invalid_body_not_json_returns_400_or_422() -> None:
+    """POST /summarize with non-JSON body returns 422 or 400."""
     response = client.post(
         "/summarize",
         content=b"not json",
         headers={"Content-Type": "application/json"},
     )
     assert response.status_code in (422, 400), f"Expected 422 or 400, got {response.status_code}"
+
+
+def test_summarize_invalid_github_url_returns_400_and_error_body() -> None:
+    """POST /summarize with non-GitHub URL returns 400 and spec error body (status, message)."""
+    response = client.post(
+        "/summarize",
+        json={"github_url": "https://gitlab.com/owner/repo"},
+    )
+    assert response.status_code == 400
+    data = response.json()
+    assert data.get("status") == "error"
+    assert "message" in data
+    assert "Invalid GitHub URL" in data["message"]
+
+
+@pytest.mark.skipif(not _has_github_token(), reason="Set GITHUB_TOKEN to run real GitHub API tests")
+def test_summarize_nonexistent_repo_returns_404_and_error_body() -> None:
+    """POST /summarize with nonexistent repo returns 404 and spec error body (real API)."""
+    response = client.post(
+        "/summarize",
+        json={"github_url": "https://github.com/this-org-xyz-123/this-repo-xyz-456"},
+    )
+    assert response.status_code == 404
+    data = response.json()
+    assert data.get("status") == "error"
+    assert "message" in data
