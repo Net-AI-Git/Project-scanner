@@ -1,5 +1,7 @@
 """Pydantic schemas for summarize API: request, success response, and error response."""
 
+from __future__ import annotations
+
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator

@@ -2,6 +2,8 @@
 
 A small API service that accepts a public GitHub repository URL and returns a human-readable summary: what the project does, which technologies it uses, and how it is structured. Built with FastAPI; uses GitHub API for repo contents and Nebius Token Factory for the LLM summary.
 
+This README provides the **step-by-step setup and run instructions**, **model choice and rationale**, and **repository processing approach** required for submission (AI Performance Engineering 2026).
+
 ---
 
 ## Requirements
@@ -11,7 +13,7 @@ A small API service that accepts a public GitHub repository URL and returns a hu
 
 ---
 
-## Setup (step-by-step)
+## Setup and run (step-by-step)
 
 1. **Clone or unpack the project** so that the `summary_api` folder and the project root (with `requirements.txt`) are available.  
    If Python is not installed, install **Python 3.12** from [python.org](https://www.python.org/downloads/) and tick "Add Python to PATH". On Windows, `py -3.12 -m venv .venv` creates a venv with 3.12 if you have multiple versions.
@@ -44,7 +46,7 @@ A small API service that accepts a public GitHub repository URL and returns a hu
    On Windows, if `pip` is not found: `py -m pip install -r requirements.txt`.
 
 5. **Configure environment variables.**  
-   Get a key at [Nebius Token Factory](https://tokenfactory.nebius.com/) (API keys: [project/api-keys](https://tokenfactory.nebius.com/project/api-keys)).
+   The LLM is configured via the **`NEBIUS_API_KEY`** environment variable (we do not hardcode API keys). Get a key at [Nebius Token Factory](https://tokenfactory.nebius.com/) (API keys: [project/api-keys](https://tokenfactory.nebius.com/project/api-keys)).
 
    **Option A — PowerShell (Windows):** set the key in the current session before running the server. Use quotes around the key:
    ```powershell
@@ -71,6 +73,8 @@ A small API service that accepts a public GitHub repository URL and returns a hu
    ```
    Restart the server after changing `.env`.
 
+6. **Run the server** — from the **project root** (see [Run the server](#run-the-server) for the command). After it starts, the `POST /summarize` endpoint is available at `http://localhost:8000/summarize`.
+
 ---
 
 ## Run the server
@@ -78,8 +82,7 @@ A small API service that accepts a public GitHub repository URL and returns a hu
 Start the server on **port 8000**. From the **project root**:
 
 ```bash
-cd summary_api
-uvicorn main:app --host 0.0.0.0 --port 8000
+uvicorn summary_api.main:app --host 0.0.0.0 --port 8000
 ```
 
 If you are already inside `summary_api`, run only: `uvicorn main:app --host 0.0.0.0 --port 8000`
@@ -90,39 +93,7 @@ The `POST /summarize` endpoint will be available at `http://localhost:8000/summa
 
 ## Test the endpoint
 
-**Recommended — readable output (full summary, no truncation):**
-
-From the project root, with the server running:
-
-```bash
-python scripts/check_full_response.py
-```
-
-This uses the repo in `request-body.json` by default. To use another repo:
-
-```bash
-python scripts/check_full_response.py "http://127.0.0.1:8000" "https://github.com/psf/requests"
-```
-
-You get a clear SUMMARY, TECHNOLOGIES (bullets), and STRUCTURE. Use `--json` at the end for raw JSON instead.
-
----
-
-**One-liner (output may be truncated in the console):**
-
-**PowerShell:**
-
-```powershell
-Invoke-RestMethod -Method Post -Uri "http://localhost:8000/summarize" -ContentType "application/json" -Body '{"github_url": "https://github.com/psf/requests"}'
-```
-
-To see the full response in PowerShell, use:
-
-```powershell
-(Invoke-WebRequest -Method Post -Uri "http://localhost:8000/summarize" -ContentType "application/json" -Body '{"github_url": "https://github.com/psf/requests"}').Content
-```
-
-**Linux/macOS/Git Bash (curl):**
+As in the task specification, you can test with:
 
 ```bash
 curl -X POST http://localhost:8000/summarize \
@@ -132,17 +103,21 @@ curl -X POST http://localhost:8000/summarize \
 
 You should get HTTP 200 and a JSON body with `summary`, `technologies`, and `structure`.
 
+**PowerShell (alternative):**
+
+```powershell
+(Invoke-WebRequest -Method Post -Uri "http://localhost:8000/summarize" -ContentType "application/json" -Body '{"github_url": "https://github.com/psf/requests"}' -UseBasicParsing).Content
+```
+
 ---
 
 ## Model choice
 
-- **Nebius Token Factory** with **Llama-3.3-70B-Instruct**. Chosen for good quality and structured output for repo summarization; API is OpenAI-compatible and keys are available from Nebius.
-
-The prompt asks the LLM for a single JSON object with `summary`, `technologies`, and `structure`; the response is parsed (with a fallback for plain text) so the API always returns the specified format.
+**Nebius Token Factory** with **Llama-3.3-70B-Instruct** — chosen for good quality and structured output for repo summarization; the API is OpenAI-compatible and keys are available from Nebius. The prompt asks the LLM for a single JSON object with `summary`, `technologies`, and `structure`; the response is parsed (with a fallback for plain text) so the API always returns the specified format.
 
 ---
 
-## Repository processing (what we include and skip)
+## Repository processing (what we include, what we skip, and why)
 
 The service does **not** send the whole repo to the LLM. It filters and prioritizes content and enforces a **context size limit** (~60k characters by default) so we stay within typical context windows.
 
