@@ -1,13 +1,13 @@
 # Summary API
 
-A small API service that accepts a public GitHub repository URL and returns a human-readable summary: what the project does, which technologies it uses, and how it is structured. Built with FastAPI; uses GitHub API for repo contents and an LLM (Google AI Studio or Nebius Token Factory) for the summary.
+A small API service that accepts a public GitHub repository URL and returns a human-readable summary: what the project does, which technologies it uses, and how it is structured. Built with FastAPI; uses GitHub API for repo contents and Nebius Token Factory for the LLM summary.
 
 ---
 
 ## Requirements
 
 - **Python 3.10+**
-- An API key for at least one LLM provider (see below).
+- A Nebius Token Factory API key (see below).
 
 ---
 
@@ -29,21 +29,13 @@ A small API service that accepts a public GitHub repository URL and returns a hu
 
 4. **Configure environment variables.**  
    From the project root, copy the example env file and edit as needed:
+   - Windows: `copy .env.example .env`
+   - macOS/Linux: `cp .env.example .env`
+   Set your Nebius API key in `.env`. Get a key at [Nebius Token Factory](https://tokenfactory.nebius.com/) (API keys: [project/api-keys](https://tokenfactory.nebius.com/project/api-keys)) and set:
    ```bash
-   copy .env.example .env
+   NEBIUS_API_KEY=your_key_here
    ```
-   Then set at least one LLM key in `.env`:
-   - **Option A — Google AI Studio (Gemini):**  
-     Get a key at [Google AI Studio](https://aistudio.google.com/apikey) and set:
-     ```bash
-     GOOGLE_API_KEY=your_key_here
-     ```
-   - **Option B — Nebius Token Factory:**  
-     Set (e.g. for evaluators or if you prefer Nebius):
-     ```bash
-     NEBIUS_API_KEY=your_key_here
-     ```
-   If both are set, the app uses Google first. **Do not commit `.env` or put API keys in code.**
+   **Do not commit `.env` or put API keys in code.**
 
    Optional: `GITHUB_TOKEN` for higher GitHub API rate limits (see `.env.example`).
 
@@ -70,6 +62,16 @@ The `POST /summarize` endpoint will be available at `http://localhost:8000/summa
 
 ## Test the endpoint
 
+Example from the task spec (Linux/macOS/Git Bash):
+
+```bash
+curl -X POST http://localhost:8000/summarize \
+  -H "Content-Type: application/json" \
+  -d '{"github_url": "https://github.com/psf/requests"}'
+```
+
+Alternatively (any shell, escaped quotes):
+
 ```bash
 curl -X POST http://localhost:8000/summarize \
   -H "Content-Type: application/json" \
@@ -82,8 +84,7 @@ You should get HTTP 200 and a JSON body with `summary`, `technologies`, and `str
 
 ## Model choice
 
-- **Default:** **Google Gemini 2.0 Flash** (when `GOOGLE_API_KEY` is set). Chosen for good speed and quality for short summarization and structured output.
-- **Fallback:** **Nebius Token Factory** with **Meta-Llama-3.1-70B-Instruct** (when `NEBIUS_API_KEY` is set and Google is not). Used so evaluators can run the app with Nebius as required.
+- **Nebius Token Factory** with **Llama-3.3-70B-Instruct**. Chosen for good quality and structured output for repo summarization; API is OpenAI-compatible and keys are available from Nebius.
 
 The prompt asks the LLM for a single JSON object with `summary`, `technologies`, and `structure`; the response is parsed (with a fallback for plain text) so the API always returns the specified format.
 
@@ -126,6 +127,18 @@ Examples: invalid or non-GitHub URL (400), repo not found or private (404), LLM 
 
 ---
 
+## Tests
+
+From the **project root**:
+
+```bash
+pytest
+```
+
+Tests live under `tests/summary_api/` and cover the API, LLM client, GitHub client, repo processor, and schemas.
+
+---
+
 ## Project layout
 
 ```
@@ -135,9 +148,9 @@ summary_api/
 ├── schemas.py       # Pydantic: request/response/error
 ├── github_client.py # Fetch repo file list and contents from GitHub API
 ├── repo_processor.py# Filter, prioritize, and build context for the LLM
-├── llm_client.py    # Call Gemini or Nebius, parse summary JSON
-├── requirements.txt # (or use project root requirements.txt)
+├── llm_client.py    # Call Nebius Token Factory, parse summary JSON
+├── audit.py         # Audit logging for requests and errors
 └── README.md        # This file
 ```
 
-Dependencies are listed in the root `requirements.txt` (e.g. `fastapi`, `uvicorn`, `pydantic-settings`, `httpx`). Use that file for `pip install -r requirements.txt` as in the setup steps above.
+Dependencies are in the project root `requirements.txt` (e.g. `fastapi`, `uvicorn`, `pydantic-settings`, `httpx`). Use that file for `pip install -r requirements.txt` as in the setup steps above.

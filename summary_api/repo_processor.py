@@ -37,7 +37,7 @@ PRIORITY_CONFIG_NAMES = frozenset({
     "package.json", "pyproject.toml", "requirements.txt", "requirements-dev.txt",
     "setup.py", "setup.cfg", "Cargo.toml", "go.mod", "go.sum", "Makefile",
     "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
-    "tsconfig.json", "webpack.config.js", "CMakeLists.txt", "Makefile",
+    "tsconfig.json", "webpack.config.js", "CMakeLists.txt",
 })
 
 

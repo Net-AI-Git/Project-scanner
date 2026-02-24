@@ -1,25 +1,24 @@
-"""LLM client: Google AI Studio (Gemini) or Nebius Token Factory to summarize repo context."""
+"""LLM client: Nebius Token Factory to summarize repo context."""
 
 from __future__ import annotations
 
 import json
 import logging
 import re
-from typing import Any, Literal
+from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-# Google AI Studio (Gemini) defaults
-GOOGLE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-GOOGLE_MODEL = "gemini-2.0-flash"
-# Nebius Token Factory (OpenAI-compatible) fallback
+# Nebius Token Factory (OpenAI-compatible). See https://tokenfactory.nebius.com/
 NEBIUS_BASE_URL = "https://api.tokenfactory.nebius.com/v1"
-NEBIUS_MODEL = "meta-llama/Meta-Llama-3.1-70B-Instruct"
+NEBIUS_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
 
-DEFAULT_TIMEOUT = 60.0
-DEFAULT_MAX_TOKENS = 2048
+# 120s: Nebius 70B can be slow on first request / under load
+DEFAULT_TIMEOUT = 120.0
+# Response is JSON with summary + technologies + structure; 2048 was often truncating. Use 4096 so full answer fits.
+DEFAULT_MAX_TOKENS = 4096
 
 # Prompt asks for structured JSON so we can parse summary, technologies, structure
 SYSTEM_PROMPT = """You are a technical writer. Given repository file contents and structure, produce a short summary in the exact JSON format below. Use only the keys "summary", "technologies", and "structure". No other keys or markdown code fences.
@@ -50,11 +49,6 @@ def _build_messages(context: str) -> list[dict[str, str]]:
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": USER_PROMPT_TEMPLATE.format(context=context)},
     ]
-
-
-def _build_gemini_prompt(context: str) -> str:
-    """Single prompt text for Gemini (system + user merged)."""
-    return f"{SYSTEM_PROMPT}\n\n{USER_PROMPT_TEMPLATE.format(context=context)}"
 
 
 def _parse_structured_response(content: str) -> dict[str, Any]:
@@ -106,69 +100,6 @@ def _parse_structured_response(content: str) -> dict[str, Any]:
     return {"summary": summary, "technologies": technologies, "structure": structure}
 
 
-def _call_gemini(
-    context: str,
-    api_key: str,
-    base_url: str,
-    model: str,
-    timeout: float,
-    max_tokens: int,
-) -> dict[str, Any]:
-    """Call Google AI Studio (Gemini) generateContent API."""
-    prompt = _build_gemini_prompt(context)
-    logger.info(
-        "=== Sending to LLM (provider=google, model=%s) — full prompt below ===\n%s\n=== end LLM prompt ===",
-        model,
-        prompt,
-    )
-    url = f"{base_url.rstrip('/')}/models/{model}:generateContent"
-    headers = {"x-goog-api-key": api_key.strip(), "Content-Type": "application/json"}
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "maxOutputTokens": max_tokens,
-            "temperature": 0.3,
-            "responseMimeType": "application/json",
-        },
-    }
-    with httpx.Client(timeout=timeout) as client:
-        response = client.post(url, json=payload, headers=headers)
-    if response.status_code == 401:
-        raise LLMClientError("LLM API authentication failed (invalid or missing API key).")
-    if response.status_code == 429:
-        raise LLMClientError("LLM API rate limit exceeded. Try again later.")
-    if response.status_code >= 500:
-        raise LLMClientError(f"LLM API server error: {response.status_code}.")
-    if response.status_code >= 400:
-        try:
-            body = response.json()
-            err = body.get("error", {}) if isinstance(body.get("error"), dict) else {}
-            msg = err.get("message", body.get("message", response.text)) or f"HTTP {response.status_code}"
-        except Exception:
-            msg = response.text or f"HTTP {response.status_code}"
-        raise LLMClientError(f"LLM API error: {msg}")
-    try:
-        data = response.json()
-    except Exception as e:
-        raise LLMClientError(f"Invalid LLM API response (not JSON): {e}") from e
-    candidates = data.get("candidates") or []
-    if not candidates or not isinstance(candidates, list):
-        raise LLMClientError("Invalid LLM API response: missing or empty candidates.")
-    first = candidates[0]
-    if not isinstance(first, dict):
-        raise LLMClientError("Invalid LLM API response: invalid candidate.")
-    content = first.get("content") or {}
-    parts = content.get("parts") or []
-    if not parts:
-        raise LLMClientError("Invalid LLM API response: no content parts.")
-    text = parts[0].get("text") if isinstance(parts[0], dict) else ""
-    if text is None:
-        text = ""
-    if not isinstance(text, str):
-        text = str(text)
-    return _parse_structured_response(text)
-
-
 def _call_nebius(
     context: str,
     api_key: str,
@@ -216,6 +147,11 @@ def _call_nebius(
     if not choices or not isinstance(choices, list):
         raise LLMClientError("Invalid LLM API response: missing or empty choices.")
     first = choices[0]
+    finish_reason = first.get("finish_reason") if isinstance(first, dict) else None
+    if finish_reason == "length":
+        logger.warning(
+            "LLM response was truncated (finish_reason=length). Consider increasing max_tokens."
+        )
     message = first.get("message") if isinstance(first, dict) else None
     if not message or not isinstance(message, dict):
         raise LLMClientError("Invalid LLM API response: missing message in choices.")
@@ -231,7 +167,6 @@ def summarize_repo(
     context: str,
     *,
     api_key: str,
-    provider: Literal["google", "nebius"] = "google",
     base_url: str | None = None,
     model: str | None = None,
     timeout: float = DEFAULT_TIMEOUT,
@@ -241,10 +176,9 @@ def summarize_repo(
 
     Args:
         context: Prepared repo context string (from repo_processor).
-        api_key: API key from config (GOOGLE_API_KEY or NEBIUS_API_KEY), never hardcoded.
-        provider: "google" for Google AI Studio (Gemini), "nebius" for Nebius Token Factory.
-        base_url: Override API base URL (defaults per provider if not set).
-        model: Override model ID (defaults per provider if not set).
+        api_key: API key from config (NEBIUS_API_KEY), never hardcoded.
+        base_url: Override API base URL (default NEBIUS_BASE_URL).
+        model: Override model ID (default NEBIUS_MODEL).
         timeout: Request timeout in seconds.
         max_tokens: Max tokens to generate.
 
@@ -255,17 +189,14 @@ def summarize_repo(
         LLMClientError: Missing API key, 401, 429, timeout, or non-2xx response.
     """
     if not (api_key or "").strip():
-        key_hint = "GOOGLE_API_KEY" if provider == "google" else "NEBIUS_API_KEY"
-        raise LLMClientError(f"LLM API key is not configured. Set {key_hint} in the environment.")
+        raise LLMClientError("LLM API key is not configured. Set NEBIUS_API_KEY in the environment.")
 
     if base_url is None:
-        base_url = GOOGLE_BASE_URL if provider == "google" else NEBIUS_BASE_URL
+        base_url = NEBIUS_BASE_URL
     if model is None:
-        model = GOOGLE_MODEL if provider == "google" else NEBIUS_MODEL
+        model = NEBIUS_MODEL
 
     try:
-        if provider == "google":
-            return _call_gemini(context, api_key, base_url, model, timeout, max_tokens)
         return _call_nebius(context, api_key, base_url, model, timeout, max_tokens)
     except httpx.TimeoutException as e:
         raise LLMClientError(f"LLM API request timed out: {e}") from e

@@ -13,27 +13,40 @@ from fastapi.responses import JSONResponse
 
 try:
     from .audit import error_detail_from_exception, log_audit, log_audit_step
-    from .config import get_settings
+    from .config import get_env_file_path, get_settings
     from .github_client import GitHubClientError, fetch_repo_files
     from .llm_client import LLMClientError, summarize_repo
     from .repo_processor import process_repo_files
-    from .schemas import SummarizeRequest, SummarizeResponse
+    from .schemas import ErrorResponse, SummarizeRequest, SummarizeResponse
 except ImportError:
     from audit import error_detail_from_exception, log_audit, log_audit_step
-    from config import get_settings
+    from config import get_env_file_path, get_settings
     from github_client import GitHubClientError, fetch_repo_files
     from llm_client import LLMClientError, summarize_repo
     from repo_processor import process_repo_files
-    from schemas import SummarizeRequest, SummarizeResponse
+    from schemas import ErrorResponse, SummarizeRequest, SummarizeResponse
 
 app = FastAPI(title="Summary API", description="Summarize public GitHub repositories")
+
+
+@app.on_event("startup")
+def _log_llm_config() -> None:
+    """Log whether LLM API key is loaded (no secrets). Helps verify .env is read."""
+    settings = get_settings()
+    env_path = get_env_file_path()
+    nebius_set = bool((settings.NEBIUS_API_KEY.get_secret_value() or "").strip())
+    logging.getLogger(__name__).info(
+        "Config: env_file=%s, NEBIUS_API_KEY=%s",
+        env_path,
+        "set" if nebius_set else "not set",
+    )
 
 
 @app.exception_handler(RequestValidationError)
 def validation_exception_handler(_request, exc: RequestValidationError) -> JSONResponse:
     """Return spec error body for validation errors (missing/invalid github_url)."""
     errors = exc.errors() or []
-    if errors and len(errors) > 0:
+    if errors:
         first = errors[0]
         msg = first.get("msg", "Invalid request")
         loc = first.get("loc", ())
@@ -45,7 +58,7 @@ def validation_exception_handler(_request, exc: RequestValidationError) -> JSONR
         msg = "Invalid request: github_url is required and must be a non-empty string"
     return JSONResponse(
         status_code=400,
-        content={"status": "error", "message": msg},
+        content=ErrorResponse(status="error", message=msg).model_dump(),
     )
 
 
@@ -78,14 +91,9 @@ def _llm_error_to_status_and_message(exc: LLMClientError) -> tuple[int, str]:
 
 
 def _get_llm_provider_and_key(settings) -> tuple[str, str]:
-    """Choose LLM provider and API key: Google if GOOGLE_API_KEY set, else Nebius."""
-    google_key = (settings.GOOGLE_API_KEY.get_secret_value() or "").strip()
-    if google_key:
-        return "google", google_key
+    """Return Nebius as provider and NEBIUS_API_KEY (or empty string if not set)."""
     nebius_key = (settings.NEBIUS_API_KEY.get_secret_value() or "").strip()
-    if nebius_key:
-        return "nebius", nebius_key
-    return "nebius", ""
+    return "nebius", nebius_key
 
 
 @app.get("/")
@@ -145,7 +153,7 @@ def summarize(request: SummarizeRequest, response: Response) -> SummarizeRespons
             )
             _audit(request.github_url, correlation_id, "failure", 404, "Repository is empty or has no readable files")
             return _with_correlation_header(
-                {"status": "error", "message": "Repository is empty or has no readable files"},
+                ErrorResponse(status="error", message="Repository is empty or has no readable files").model_dump(),
                 404,
                 correlation_id,
             )
@@ -171,7 +179,7 @@ def summarize(request: SummarizeRequest, response: Response) -> SummarizeRespons
         )
         status, message = _github_error_to_status_and_message(e)
         _audit(request.github_url, correlation_id, "failure", status, message)
-        return _with_correlation_header({"status": "error", "message": message}, status, correlation_id)
+        return _with_correlation_header(ErrorResponse(status="error", message=message).model_dump(), status, correlation_id)
 
     # Step 2: process_repo_files
     t1 = time.perf_counter()
@@ -199,13 +207,19 @@ def summarize(request: SummarizeRequest, response: Response) -> SummarizeRespons
             duration_ms=duration_ms,
         )
         _audit(request.github_url, correlation_id, "failure", 500, str(e))
-        return _with_correlation_header({"status": "error", "message": str(e)}, 500, correlation_id)
+        return _with_correlation_header(ErrorResponse(status="error", message=str(e)).model_dump(), 500, correlation_id)
 
-    # Step 3: summarize_repo (LLM)
+    # Step 3: summarize_repo (LLM) — base_url and model from Settings so .env overrides apply
     provider, api_key = _get_llm_provider_and_key(settings)
     t2 = time.perf_counter()
     try:
-        result = summarize_repo(context, api_key=api_key, provider=provider)
+        result = summarize_repo(
+            context,
+            api_key=api_key,
+            base_url=settings.NEBIUS_BASE_URL,
+            model=settings.NEBIUS_MODEL,
+            max_tokens=settings.NEBIUS_MAX_TOKENS,
+        )
         duration_ms = (time.perf_counter() - t2) * 1000
         log_audit_step(
             correlation_id,
@@ -233,12 +247,20 @@ def summarize(request: SummarizeRequest, response: Response) -> SummarizeRespons
         )
         status, message = _llm_error_to_status_and_message(e)
         _audit(request.github_url, correlation_id, "failure", status, message)
-        return _with_correlation_header({"status": "error", "message": message}, status, correlation_id)
+        return _with_correlation_header(ErrorResponse(status="error", message=message).model_dump(), status, correlation_id)
 
     _audit(request.github_url, correlation_id, "success", 200)
     response.headers["X-Correlation-ID"] = correlation_id
+    summary_str = result.get("summary", "") or ""
+    structure_str = result.get("structure", "") or ""
+    # Log lengths so you can tell: if summary_len is small, LLM truncated; if large, client/UI is truncating display
+    logging.getLogger(__name__).info(
+        "Response lengths: summary=%d chars, structure=%d chars",
+        len(summary_str),
+        len(structure_str),
+    )
     return SummarizeResponse(
-        summary=result.get("summary", "") or "",
+        summary=summary_str,
         technologies=result.get("technologies") or [],
-        structure=result.get("structure", "") or "",
+        structure=structure_str,
     )

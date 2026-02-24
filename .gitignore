@@ -12,6 +12,7 @@ __pycache__/
 *.pyo
 .pytest_cache/
 pytest-cache-files-*
+tests/
 
 # Virtual environment
 .venv/

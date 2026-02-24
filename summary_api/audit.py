@@ -142,6 +142,9 @@ def get_session_context_for_judge(
 ) -> dict[str, Any]:
     """Load all audit entries for one request to feed LLM-as-Judge.
 
+    For external / CLI use only (e.g. Judge tool or scripts that read AUDIT.jsonl).
+    Not called from the Summary API itself.
+
     Returns a Session Context with execution logs (steps in order), final outcome,
     and optional performance info, matching the input expected by the LLM Judge
     rule (Execution Logs, Audit Comparison, Final Output).

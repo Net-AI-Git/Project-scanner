@@ -19,7 +19,7 @@ def test_summarize_repo_missing_api_key_raises() -> None:
     """Empty or missing API key raises LLMClientError (key must come from config, not hardcoded)."""
     with pytest.raises(LLMClientError) as exc_info:
         summarize_repo("some context", api_key="")
-    assert "API key" in exc_info.value.message or "GOOGLE_API_KEY" in exc_info.value.message or "NEBIUS" in exc_info.value.message
+    assert "API key" in exc_info.value.message or "NEBIUS_API_KEY" in exc_info.value.message
 
     with pytest.raises(LLMClientError):
         summarize_repo("context", api_key="   ")
@@ -132,34 +132,9 @@ def test_summarize_repo_success_nebius_returns_three_fields() -> None:
         mock_client.return_value.__enter__.return_value = mock_instance
         mock_client.return_value.__exit__.return_value = None
 
-        result = summarize_repo("repo context", api_key="fake-key", provider="nebius")
+        result = summarize_repo("repo context", api_key="fake-key")
         assert result["summary"] == "HTTP library."
         assert result["technologies"] == ["Python", "urllib3"]
         assert result["structure"] == "src/ and tests/."
 
 
-def test_summarize_repo_success_google_returns_three_fields() -> None:
-    """Successful Google AI Studio (Gemini) response is parsed into summary, technologies, structure."""
-    body = {
-        "candidates": [
-            {
-                "content": {
-                    "parts": [
-                        {"text": '{"summary": "A Python HTTP library.", "technologies": ["Python", "urllib3"], "structure": "src/ and tests/."}'}
-                    ]
-                }
-            }
-        ],
-    }
-    with patch("summary_api.llm_client.httpx.Client") as mock_client:
-        mock_post = MagicMock()
-        mock_post.return_value = httpx.Response(200, json=body)
-        mock_instance = MagicMock()
-        mock_instance.post = mock_post
-        mock_client.return_value.__enter__.return_value = mock_instance
-        mock_client.return_value.__exit__.return_value = None
-
-        result = summarize_repo("repo context", api_key="fake-key", provider="google")
-        assert result["summary"] == "A Python HTTP library."
-        assert result["technologies"] == ["Python", "urllib3"]
-        assert result["structure"] == "src/ and tests/."

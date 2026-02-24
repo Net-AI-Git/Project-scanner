@@ -15,10 +15,8 @@ def _has_github_token() -> bool:
 
 
 def _has_llm_key() -> bool:
-    """True if at least one LLM API key is set (for full summarize flow)."""
-    return bool(os.environ.get("GOOGLE_API_KEY", "").strip()) or bool(
-        os.environ.get("NEBIUS_API_KEY", "").strip()
-    )
+    """True if Nebius LLM API key is set (for full summarize flow)."""
+    return bool(os.environ.get("NEBIUS_API_KEY", "").strip())
 
 
 # --- GET / ---
@@ -46,7 +44,7 @@ def test_root_returns_json_with_message_and_docs() -> None:
 
 @pytest.mark.skipif(
     not (_has_github_token() and _has_llm_key()),
-    reason="Set GITHUB_TOKEN and GOOGLE_API_KEY or NEBIUS_API_KEY for full flow",
+    reason="Set GITHUB_TOKEN and NEBIUS_API_KEY for full flow",
 )
 def test_summarize_happy_path_real_api() -> None:
     """POST /summarize with valid github_url: real GitHub + LLM. 200 + spec fields, or 429 (rate limit) + error body."""
