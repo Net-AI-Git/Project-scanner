@@ -1,7 +1,8 @@
-"""FastAPI application: POST /summarize — full flow: GitHub → repo_processor → LLM → response."""
+"""FastAPI application: POST /summarize — full flow: GitHub → process by folder → LLM per folder → LLM project → response."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -24,16 +25,24 @@ try:
     from .config import get_env_file_path, get_settings
     from .dlq import write_to_dlq
     from .github_client import GitHubClientError, RepoFile, fetch_repo_files
-    from .llm_client import LLMClientError, summarize_repo
-    from .repo_processor import process_repo_files
+    from .llm_client import (
+        LLMClientError,
+        summarize_folder,
+        summarize_project_from_folders,
+    )
+    from .repo_processor import process_repo_files_by_folder
     from .schemas import ErrorResponse, SummarizeRequest, SummarizeResponse
 except ImportError:
     from summary_api.audit import error_detail_from_exception, log_audit, log_audit_step
     from summary_api.config import get_env_file_path, get_settings
     from summary_api.dlq import write_to_dlq
     from summary_api.github_client import GitHubClientError, RepoFile, fetch_repo_files
-    from summary_api.llm_client import LLMClientError, summarize_repo
-    from summary_api.repo_processor import process_repo_files
+    from summary_api.llm_client import (
+        LLMClientError,
+        summarize_folder,
+        summarize_project_from_folders,
+    )
+    from summary_api.repo_processor import process_repo_files_by_folder
     from summary_api.schemas import ErrorResponse, SummarizeRequest, SummarizeResponse
 
 @asynccontextmanager
@@ -56,13 +65,12 @@ logger = logging.getLogger(__name__)
 
 
 def _configure_structured_logging() -> None:
-    """Configure JSON structured logging when LOG_FORMAT=json for observability."""
+    """Configure JSON structured logging when Settings.LOG_FORMAT=json for observability."""
     if not hasattr(_configure_structured_logging, "_done"):
         _configure_structured_logging._done = False
     if _configure_structured_logging._done:
         return
-    import os
-    if os.environ.get("LOG_FORMAT") == "json":
+    if get_settings().LOG_FORMAT == "json":
         for h in logging.root.handlers[:]:
             logging.root.removeHandler(h)
         handler = logging.StreamHandler()
@@ -335,38 +343,35 @@ async def _run_fetch_step(
         )
 
 
-def _run_process_step(
+def _run_process_by_folder_step(
     correlation_id: str,
     files: list[RepoFile],
-) -> tuple[str | None, JSONResponse | None]:
-    """Run process_repo_files step; return (context, None) on success or (None, error_response) on failure.
-
-    Why: Keeps summarize() under 20 lines; process is sync and fast.
-    What: Calls process_repo_files, measures duration, logs audit step.
-
-    Args:
-        correlation_id: Request UUID.
-        files: List of repo files from fetch step.
-
-    Returns:
-        (context, None) on success; (None, JSONResponse) on failure.
-    """
+    max_chars_per_folder: int,
+) -> tuple[list[tuple[str, str]] | None, JSONResponse | None]:
+    """Run process_repo_files_by_folder; return (folder_contexts, None) or (None, error_response)."""
     t0 = time.perf_counter()
     try:
-        context = process_repo_files(files)
-        duration_ms = (time.perf_counter() - t0) * 1000
-        log_audit_step(
-            correlation_id, "process_repo_files", "success",
-            step_index=2, input_summary={"file_count": len(files)},
-            output_summary={"context_length": len(context)}, duration_ms=duration_ms,
+        folder_contexts = process_repo_files_by_folder(
+            files, max_chars_per_folder=max_chars_per_folder or None
         )
-        return context, None
+        duration_ms = (time.perf_counter() - t0) * 1000
+        total_chars = sum(len(ctx) for _, ctx in folder_contexts)
+        log_audit_step(
+            correlation_id, "process_repo_files_by_folder", "success",
+            step_index=2, input_summary={"file_count": len(files)},
+            output_summary={"folder_count": len(folder_contexts), "total_context_length": total_chars},
+            duration_ms=duration_ms,
+        )
+        return folder_contexts, None
     except Exception as e:
         duration_ms = (time.perf_counter() - t0) * 1000
         log_audit_step(
-            correlation_id, "process_repo_files", "failure",
+            correlation_id, "process_repo_files_by_folder", "failure",
             step_index=2, input_summary={"file_count": len(files)},
-            error_detail={**error_detail_from_exception(e, "summary_api.repo_processor.process_repo_files"), "error_classification": "permanent"},
+            error_detail={
+                **error_detail_from_exception(e, "summary_api.repo_processor.process_repo_files_by_folder"),
+                "error_classification": "permanent",
+            },
             duration_ms=duration_ms,
         )
         return None, _with_correlation_header(
@@ -374,39 +379,101 @@ def _run_process_step(
         )
 
 
-async def _run_llm_step(
+def _llm_kwargs(settings: object) -> dict:
+    """Build kwargs for LLM calls from settings."""
+    return {
+        "api_key": _get_llm_provider_and_key(settings)[1],
+        "base_url": getattr(settings, "NEBIUS_BASE_URL", None),
+        "model": getattr(settings, "NEBIUS_MODEL", None),
+        "max_tokens": getattr(settings, "NEBIUS_MAX_TOKENS", 4096),
+    }
+
+
+async def _run_folder_summaries_step(
     correlation_id: str,
-    context: str,
+    folder_contexts: list[tuple[str, str]],
     settings: object,
-) -> tuple[dict | None, JSONResponse | None]:
-    """Run summarize_repo (LLM) step; return (result, None) on success or (None, error_response) on failure.
-
-    Why: Keeps summarize() under 20 lines by extracting LLM call and audit.
-    What: Gets provider/key from settings, awaits async summarize_repo, logs audit step; on exception writes DLQ and returns error.
-
-    Args:
-        correlation_id: Request UUID.
-        context: Prepared context from process step.
-        settings: Application Settings.
-
-    Returns:
-        (result_dict, None) on success; (None, JSONResponse) on failure.
-    """
+) -> tuple[list[dict[str, str]] | None, JSONResponse | None]:
+    """Run summarize_folder for each folder in parallel; return (folder_summaries, None) or (None, error_response)."""
     provider, api_key = _get_llm_provider_and_key(settings)
     t0 = time.perf_counter()
-    input_summary = {"context_length": len(context), "provider": provider}
+    kwargs = _llm_kwargs(settings)
+    folder_names = [name for name, _ in folder_contexts]
+    input_summary = {"folder_count": len(folder_contexts), "folder_names": folder_names, "provider": provider}
     try:
-        result = await summarize_repo(
-            context,
-            api_key=api_key,
-            base_url=getattr(settings, "NEBIUS_BASE_URL", None),
-            model=getattr(settings, "NEBIUS_MODEL", None),
-            max_tokens=getattr(settings, "NEBIUS_MAX_TOKENS", 4096),
-        )
+        tasks = [
+            summarize_folder(context, name, **kwargs)
+            for name, context in folder_contexts
+        ]
+        results = await asyncio.gather(*tasks)
+        folder_summaries = [
+            {"folder": name, "summary": (r.get("summary") or "").strip()}
+            for (name, _), r in zip(folder_contexts, results)
+        ]
         duration_ms = (time.perf_counter() - t0) * 1000
         log_audit_step(
-            correlation_id, "summarize_repo", "success",
+            correlation_id, "summarize_folders", "success",
             step_index=3, input_summary=input_summary,
+            output_summary={"folder_summary_count": len(folder_summaries)},
+            duration_ms=duration_ms,
+        )
+        return folder_summaries, None
+    except LLMClientError as e:
+        duration_ms = (time.perf_counter() - t0) * 1000
+        err_detail = _error_detail_with_classification(e, "summary_api.llm_client.summarize_folder")
+        log_audit_step(
+            correlation_id, "summarize_folders", "failure",
+            step_index=3, input_summary=input_summary,
+            error_detail=err_detail,
+            duration_ms=duration_ms,
+        )
+        write_to_dlq(
+            correlation_id, "summarize_folders",
+            request_summary=input_summary,
+            error_detail=err_detail,
+        )
+        status, message = _llm_error_to_status_and_message(e)
+        return None, _with_correlation_header(
+            ErrorResponse(status="error", message=message).model_dump(), status, correlation_id
+        )
+    except CircuitBreakerError as e:
+        duration_ms = (time.perf_counter() - t0) * 1000
+        log_audit_step(
+            correlation_id, "summarize_folders", "failure",
+            step_index=3, input_summary=input_summary,
+            error_detail={
+                "message": "Service temporarily unavailable (circuit open)",
+                "where": "summary_api.llm_client.summarize_folder",
+                "error_classification": "transient",
+            },
+            duration_ms=duration_ms,
+        )
+        write_to_dlq(
+            correlation_id, "summarize_folders",
+            request_summary=input_summary,
+            error_detail={"message": str(e), "error_classification": "transient"},
+        )
+        return None, _with_correlation_header(
+            ErrorResponse(status="error", message="Service temporarily unavailable. Try again later.").model_dump(),
+            503, correlation_id,
+        )
+
+
+async def _run_project_summary_step(
+    correlation_id: str,
+    folder_summaries: list[dict[str, str]],
+    settings: object,
+) -> tuple[dict | None, JSONResponse | None]:
+    """Run summarize_project_from_folders; return (result_dict, None) or (None, error_response)."""
+    provider, api_key = _get_llm_provider_and_key(settings)
+    t0 = time.perf_counter()
+    input_summary = {"folder_summary_count": len(folder_summaries), "provider": provider}
+    try:
+        result = await summarize_project_from_folders(folder_summaries, **_llm_kwargs(settings))
+        duration_ms = (time.perf_counter() - t0) * 1000
+        log_audit_step(
+            correlation_id, "summarize_project", "success",
+            step_index=4, input_summary=input_summary,
             output_summary={
                 "summary_length": len(result.get("summary", "") or ""),
                 "technologies_count": len(result.get("technologies") or []),
@@ -417,16 +484,18 @@ async def _run_llm_step(
         return result, None
     except LLMClientError as e:
         duration_ms = (time.perf_counter() - t0) * 1000
-        err_detail = _error_detail_with_classification(e, "summary_api.llm_client.summarize_repo")
+        err_detail = _error_detail_with_classification(
+            e, "summary_api.llm_client.summarize_project_from_folders"
+        )
         log_audit_step(
-            correlation_id, "summarize_repo", "failure",
-            step_index=3, input_summary=input_summary,
+            correlation_id, "summarize_project", "failure",
+            step_index=4, input_summary=input_summary,
             error_detail=err_detail,
             duration_ms=duration_ms,
         )
         write_to_dlq(
-            correlation_id, "summarize_repo",
-            request_summary={"context_length": len(context), "provider": provider},
+            correlation_id, "summarize_project",
+            request_summary=input_summary,
             error_detail=err_detail,
         )
         status, message = _llm_error_to_status_and_message(e)
@@ -436,13 +505,17 @@ async def _run_llm_step(
     except CircuitBreakerError as e:
         duration_ms = (time.perf_counter() - t0) * 1000
         log_audit_step(
-            correlation_id, "summarize_repo", "failure",
-            step_index=3, input_summary=input_summary,
-            error_detail={"message": "Service temporarily unavailable (circuit open)", "where": "summary_api.llm_client.summarize_repo", "error_classification": "transient"},
+            correlation_id, "summarize_project", "failure",
+            step_index=4, input_summary=input_summary,
+            error_detail={
+                "message": "Service temporarily unavailable (circuit open)",
+                "where": "summary_api.llm_client.summarize_project_from_folders",
+                "error_classification": "transient",
+            },
             duration_ms=duration_ms,
         )
         write_to_dlq(
-            correlation_id, "summarize_repo",
+            correlation_id, "summarize_project",
             request_summary=input_summary,
             error_detail={"message": str(e), "error_classification": "transient"},
         )
@@ -465,11 +538,7 @@ def root() -> dict[str, str]:
 async def summarize(
     request: SummarizeRequest, response: Response
 ) -> SummarizeResponse | JSONResponse:
-    """Full flow: fetch repo → process context → LLM summarize → return JSON per spec.
-
-    Why: Single entrypoint for the summarize API; delegates to step helpers for clarity and rule compliance (max 20 lines).
-    What: Runs fetch, process, LLM steps in order; on any failure returns error response; on success audits and returns SummarizeResponse.
-    """
+    """Full flow: fetch → process by folder → LLM per folder (parallel) → LLM project → return JSON per spec."""
     correlation_id = str(uuid.uuid4())
     settings = get_settings()
     github_token = settings.GITHUB_TOKEN.get_secret_value() or None
@@ -479,12 +548,24 @@ async def summarize(
         _audit(request.github_url, correlation_id, "failure", err.status_code, None)
         return err
 
-    context, err = _run_process_step(correlation_id, files)
+    max_chars_per_folder = getattr(settings, "SUMMARY_MAX_CONTEXT_PER_FOLDER", 0)
+    folder_contexts, err = _run_process_by_folder_step(
+        correlation_id, files, max_chars_per_folder
+    )
     if err is not None:
         _audit(request.github_url, correlation_id, "failure", err.status_code, None)
         return err
 
-    result, err = await _run_llm_step(correlation_id, context, settings)
+    folder_summaries, err = await _run_folder_summaries_step(
+        correlation_id, folder_contexts, settings
+    )
+    if err is not None:
+        _audit(request.github_url, correlation_id, "failure", err.status_code, None)
+        return err
+
+    result, err = await _run_project_summary_step(
+        correlation_id, folder_summaries, settings
+    )
     if err is not None:
         _audit(request.github_url, correlation_id, "failure", err.status_code, None)
         return err

@@ -21,12 +21,6 @@ import traceback
 from datetime import datetime, timezone
 from typing import Any
 
-# Default: project root, or set AUDIT_LOG_PATH in env
-DEFAULT_AUDIT_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "AUDIT.jsonl",
-)
-
 
 def _timestamp_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -47,7 +41,10 @@ def log_audit(
     Required fields per audit-protocol RULE.mdc §1 Audit Log Structure.
     Hash computed over entry (without log_hash) per §1 Immutable Logs.
     """
-    path = audit_path or os.environ.get("AUDIT_LOG_PATH", DEFAULT_AUDIT_PATH)
+    if audit_path is None:
+        from summary_api.config import get_settings
+        audit_path = get_settings().AUDIT_LOG_PATH
+    path = audit_path
     entry = {
         "timestamp": _timestamp_utc(),
         "event_type": event_type,
@@ -157,7 +154,10 @@ def get_session_context_for_judge(
         Dict with keys: correlation_id, execution_logs (list of step entries),
         api_request (final api_request entry if any), session_summary.
     """
-    path = audit_path or os.environ.get("AUDIT_LOG_PATH", DEFAULT_AUDIT_PATH)
+    if audit_path is None:
+        from summary_api.config import get_settings
+        audit_path = get_settings().AUDIT_LOG_PATH
+    path = audit_path
     execution_logs: list[dict[str, Any]] = []
     api_request: dict[str, Any] | None = None
 

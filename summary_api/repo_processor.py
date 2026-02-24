@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import re
-from typing import List, Sequence
+from typing import List, Sequence, Tuple
 
 from .github_client import RepoFile
+
+# Root-level files (no path segment) go under this key.
+ROOT_FOLDER_KEY = "(root)"
 
 # Default context size: ~60k chars leaves room for prompt + response in typical 8k–32k context windows.
 DEFAULT_MAX_CONTEXT_CHARS = 60_000
@@ -46,6 +49,18 @@ def _path_segments(path: str) -> List[str]:
     return [p for p in path.replace("\\", "/").split("/") if p]
 
 
+def _top_level_folder(path: str) -> str:
+    """Return top-level folder for path: first segment or ROOT_FOLDER_KEY for root-level files.
+
+    Why: Per-folder summarization groups files by one folder level only.
+    What: One segment (e.g. src/foo/bar.py -> src); README.md -> (root).
+    """
+    segments = _path_segments(path)
+    if len(segments) <= 1:
+        return ROOT_FOLDER_KEY
+    return segments[0]
+
+
 def should_skip_path(path: str) -> bool:
     """Return True if this path should be skipped (binary dirs, lock files, etc.)."""
     segments = _path_segments(path)
@@ -60,6 +75,27 @@ def should_skip_path(path: str) -> bool:
         if pat.search(base):
             return True
     return False
+
+
+def group_files_by_top_level_folder(files: Sequence[RepoFile]) -> dict[str, List[RepoFile]]:
+    """Group files by top-level folder; skip paths are excluded from any group.
+
+    Why: Per-folder summarization needs one list of files per folder.
+    What: _top_level_folder for key; only include files where should_skip_path is False.
+
+    Returns:
+        Dict mapping folder name (or ROOT_FOLDER_KEY) to list of RepoFile.
+    """
+    out: dict[str, List[RepoFile]] = {}
+    for f in files:
+        path = f.path or ""
+        if should_skip_path(path):
+            continue
+        key = _top_level_folder(path)
+        if key not in out:
+            out[key] = []
+        out[key].append(f)
+    return out
 
 
 def _file_priority(path: str) -> int:
@@ -105,42 +141,30 @@ def _build_directory_tree(paths: List[str], max_entries: int = 200) -> str:
     return "\n".join(lines)
 
 
-def process_repo_files(
-    files: Sequence[RepoFile],
-    max_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+def _build_context_for_files(
+    files: List[RepoFile],
+    max_chars: int,
 ) -> str:
-    """Filter, prioritize, and merge repo files into a single context string for the LLM.
+    """Build one context string from already-filtered files (tree + key files, priority, truncation).
 
-    - Skips: binary dirs (node_modules, __pycache__, .git, venv, ...), lock files, minified files.
-    - Prioritizes: README, LICENSE, config files (package.json, pyproject.toml, ...), then source.
-    - Enforces max_chars by truncating low-priority file contents and then dropping files.
-
-    Returns:
-        Single string: directory tree + key file contents, suitable for LLM context.
+    Why: Shared by process_repo_files and per-folder context building.
+    What: Caps single-file size, builds tree + key files section, enforces max_chars.
     """
-    filtered: List[RepoFile] = []
-    for f in files:
-        path = f.path or ""
-        content = f.content or ""
-        if should_skip_path(path):
-            continue
-        # Cap single-file size to leave room for other files
-        if len(content) > max_chars // 3:
-            content = content[: max_chars // 3] + "\n\n[... truncated for context limit ...]"
-        filtered.append(RepoFile(path=path, content=content))
-
-    if not filtered:
+    if not files:
         return "Repository has no included text files (all skipped or empty)."
-
-    paths = [f.path for f in filtered]
+    capped: List[RepoFile] = []
+    single_cap = max(max_chars // 3, 1)
+    for f in files:
+        content = (f.content or "").strip()
+        if len(content) > single_cap:
+            content = content[:single_cap] + "\n\n[... truncated for context limit ...]"
+        capped.append(RepoFile(path=f.path or "", content=content))
+    paths = [f.path for f in capped]
     tree_section = "## Repository structure\n\n```\n" + _build_directory_tree(paths) + "\n```"
     parts: List[str] = [tree_section, "\n\n## Key files\n"]
     used = len(tree_section) + len("\n\n## Key files\n")
-
-    # Sort by priority, then by path
-    ordered = sorted(filtered, key=lambda f: (_file_priority(f.path), f.path))
     omission_msg = "\n\n(Additional files omitted due to context limit.)"
-
+    ordered = sorted(capped, key=lambda x: (_file_priority(x.path), x.path))
     for f in ordered:
         if used + len(omission_msg) >= max_chars:
             parts.append(omission_msg)
@@ -157,5 +181,55 @@ def process_repo_files(
             body = body[:remaining] + "\n\n[... truncated ...]"
         parts.append(header + body)
         used += len(header) + len(body)
-
     return "".join(parts)
+
+
+def process_repo_files(
+    files: Sequence[RepoFile],
+    max_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+) -> str:
+    """Filter, prioritize, and merge repo files into a single context string for the LLM.
+
+    - Skips: binary dirs (node_modules, __pycache__, .git, venv, ...), lock files, minified files.
+    - Prioritizes: README, LICENSE, config files (package.json, pyproject.toml, ...), then source.
+    - Enforces max_chars by truncating low-priority file contents and then dropping files.
+
+    Returns:
+        Single string: directory tree + key file contents, suitable for LLM context.
+    """
+    filtered: List[RepoFile] = []
+    for f in files:
+        path = f.path or ""
+        if should_skip_path(path):
+            continue
+        filtered.append(RepoFile(path=path, content=f.content or ""))
+    return _build_context_for_files(filtered, max_chars)
+
+
+def process_repo_files_by_folder(
+    files: Sequence[RepoFile],
+    max_chars_per_folder: int | None = None,
+) -> List[Tuple[str, str]]:
+    """Group files by top-level folder, build context per folder; return (folder_name, context) list.
+
+    Why: Two-phase summarization needs one context per folder for parallel LLM calls.
+    What: group_files_by_top_level_folder then _build_context_for_files per group; sorted by folder.
+
+    Args:
+        files: All repo files (filtering applied inside grouping).
+        max_chars_per_folder: Cap per folder. If None or 0, use DEFAULT_MAX_CONTEXT_CHARS / num_folders.
+
+    Returns:
+        List of (folder_name, context) ordered by folder name, e.g. [("(root)", "..."), ("src", "...")].
+    """
+    groups = group_files_by_top_level_folder(files)
+    if not groups:
+        return [(ROOT_FOLDER_KEY, "Repository has no included text files (all skipped or empty).")]
+    n = len(groups)
+    cap = max_chars_per_folder or max(1, DEFAULT_MAX_CONTEXT_CHARS // n)
+    result: List[Tuple[str, str]] = []
+    for folder_name in sorted(groups.keys()):
+        group_files = groups[folder_name]
+        ctx = _build_context_for_files(group_files, cap)
+        result.append((folder_name, ctx))
+    return result

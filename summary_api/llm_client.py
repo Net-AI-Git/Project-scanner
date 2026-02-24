@@ -18,27 +18,14 @@ from tenacity import (
 
 logger = logging.getLogger(__name__)
 
-# Nebius Token Factory (OpenAI-compatible). See https://tokenfactory.nebius.com/
-NEBIUS_BASE_URL = "https://api.tokenfactory.nebius.com/v1"
-NEBIUS_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
-
+# Operational constants (not API keys, model names, or paths — per configuration rule).
 DEFAULT_TIMEOUT = 120.0
 DEFAULT_MAX_TOKENS = 4096
 RETRY_ATTEMPTS = 3
 RETRY_MIN_WAIT = 1
 RETRY_MAX_WAIT = 60
 
-# Prompt asks for structured JSON so we can parse summary, technologies, structure
-SYSTEM_PROMPT = """You are a technical writer. Given repository file contents and structure, produce a short summary in the exact JSON format below. Use only the keys "summary", "technologies", and "structure". No other keys or markdown code fences.
-
-Format:
-{"summary": "1-3 sentences describing what the project does.", "technologies": ["Python", "FastAPI", ...], "structure": "Brief description of directory layout and key folders."}"""
-
-USER_PROMPT_TEMPLATE = """Summarize this repository based on the following context.
-
-{context}
-"""
-
+from . import prompts as _prompts
 
 class LLMClientError(Exception):
     """Raised when the LLM API call fails.
@@ -59,11 +46,8 @@ def _is_llm_transient(exc: BaseException) -> bool:
 
 
 def _build_messages(context: str) -> list[dict[str, str]]:
-    """Build chat messages for OpenAI-compatible (Nebius) completion request."""
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": USER_PROMPT_TEMPLATE.format(context=context)},
-    ]
+    """Build chat messages for full-repo summarization (legacy)."""
+    return _prompts.build_repo_messages(context)
 
 
 def _parse_structured_response(content: str) -> dict[str, Any]:
@@ -113,16 +97,35 @@ def _parse_structured_response(content: str) -> dict[str, Any]:
     return {"summary": summary, "technologies": technologies, "structure": structure}
 
 
-async def _call_nebius(
-    context: str,
+def _parse_folder_summary_response(content: str) -> dict[str, Any]:
+    """Parse folder-summary LLM response to dict with single key 'summary'."""
+    if not (content or "").strip():
+        return {"summary": ""}
+    text = content.strip()
+    code_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if code_match:
+        text = code_match.group(1).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {"summary": content.strip()}
+    if not isinstance(data, dict):
+        return {"summary": content.strip()}
+    summary = data.get("summary")
+    if not isinstance(summary, str):
+        summary = str(summary) if summary is not None else ""
+    return {"summary": summary}
+
+
+async def _post_messages(
+    messages: list[dict[str, str]],
     api_key: str,
     base_url: str,
     model: str,
     timeout: float,
     max_tokens: int,
-) -> dict[str, Any]:
-    """Call Nebius Token Factory (OpenAI-compatible) chat/completions API (async)."""
-    messages = _build_messages(context)
+) -> str:
+    """Send messages to Nebius chat/completions; return raw content string. Shared by repo/folder/project calls."""
     logger.info(
         "=== Sending to LLM (provider=nebius, model=%s) — full messages below ===\n%s\n=== end LLM messages ===",
         model,
@@ -195,6 +198,20 @@ async def _call_nebius(
         content = ""
     if not isinstance(content, str):
         content = str(content)
+    return content
+
+
+async def _call_nebius(
+    context: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    timeout: float,
+    max_tokens: int,
+) -> dict[str, Any]:
+    """Call Nebius for full-repo summarization (legacy); returns summary, technologies, structure."""
+    messages = _build_messages(context)
+    content = await _post_messages(messages, api_key, base_url, model, timeout, max_tokens)
     return _parse_structured_response(content)
 
 
@@ -209,8 +226,8 @@ async def summarize_repo(
     context: str,
     *,
     api_key: str,
-    base_url: str | None = None,
-    model: str | None = None,
+    base_url: str,
+    model: str,
     timeout: float = DEFAULT_TIMEOUT,
     max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> dict[str, Any]:
@@ -222,8 +239,8 @@ async def summarize_repo(
     Args:
         context: Prepared repo context string (from repo_processor).
         api_key: API key from config (NEBIUS_API_KEY), never hardcoded.
-        base_url: Override API base URL (default NEBIUS_BASE_URL).
-        model: Override model ID (default NEBIUS_MODEL).
+        base_url: API base URL (from Settings.NEBIUS_BASE_URL).
+        model: Model ID (from Settings.NEBIUS_MODEL).
         timeout: Request timeout in seconds.
         max_tokens: Max tokens to generate.
 
@@ -239,11 +256,16 @@ async def summarize_repo(
             "LLM API key is not configured. Set NEBIUS_API_KEY in the environment.",
             is_transient=False,
         )
-
-    if base_url is None:
-        base_url = NEBIUS_BASE_URL
-    if model is None:
-        model = NEBIUS_MODEL
+    if not (base_url or "").strip():
+        raise LLMClientError(
+            "LLM base_url is not configured. Set NEBIUS_BASE_URL in the environment.",
+            is_transient=False,
+        )
+    if not (model or "").strip():
+        raise LLMClientError(
+            "LLM model is not configured. Set NEBIUS_MODEL in the environment.",
+            is_transient=False,
+        )
 
     try:
         return await _call_nebius(
@@ -257,3 +279,84 @@ async def summarize_repo(
         raise LLMClientError(
             f"LLM API network error: {e}", is_transient=True
         ) from e
+
+
+@circuit(failure_threshold=5, recovery_timeout=60, expected_exception=LLMClientError)
+@retry(
+    retry=retry_if_exception(_is_llm_transient),
+    stop=stop_after_attempt(RETRY_ATTEMPTS),
+    wait=wait_random_exponential(multiplier=1, min=RETRY_MIN_WAIT, max=RETRY_MAX_WAIT),
+    reraise=True,
+)
+async def summarize_folder(
+    context: str,
+    folder_name: str,
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    timeout: float = DEFAULT_TIMEOUT,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> dict[str, Any]:
+    """Call LLM to summarize one folder's context; returns dict with key 'summary'.
+
+    Same retry and circuit breaker as summarize_repo.
+    base_url and model must be provided from Settings (no hardcoded defaults).
+    """
+    if not (api_key or "").strip():
+        raise LLMClientError(
+            "LLM API key is not configured. Set NEBIUS_API_KEY in the environment.",
+            is_transient=False,
+        )
+    if not (base_url or "").strip() or not (model or "").strip():
+        raise LLMClientError(
+            "base_url and model must be provided from Settings (NEBIUS_BASE_URL, NEBIUS_MODEL).",
+            is_transient=False,
+        )
+    messages = _prompts.build_folder_summary_messages(folder_name, context)
+    try:
+        content = await _post_messages(messages, api_key, base_url, model, timeout, max_tokens)
+        return _parse_folder_summary_response(content)
+    except httpx.TimeoutException as e:
+        raise LLMClientError(f"LLM API request timed out: {e}", is_transient=True) from e
+    except httpx.NetworkError as e:
+        raise LLMClientError(f"LLM API network error: {e}", is_transient=True) from e
+
+
+@circuit(failure_threshold=5, recovery_timeout=60, expected_exception=LLMClientError)
+@retry(
+    retry=retry_if_exception(_is_llm_transient),
+    stop=stop_after_attempt(RETRY_ATTEMPTS),
+    wait=wait_random_exponential(multiplier=1, min=RETRY_MIN_WAIT, max=RETRY_MAX_WAIT),
+    reraise=True,
+)
+async def summarize_project_from_folders(
+    folder_summaries: list[dict[str, str]],
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    timeout: float = DEFAULT_TIMEOUT,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> dict[str, Any]:
+    """Call LLM to synthesize project summary from folder summaries; returns summary, technologies, structure.
+    base_url and model must be provided from Settings (no hardcoded defaults).
+    """
+    if not (api_key or "").strip():
+        raise LLMClientError(
+            "LLM API key is not configured. Set NEBIUS_API_KEY in the environment.",
+            is_transient=False,
+        )
+    if not (base_url or "").strip() or not (model or "").strip():
+        raise LLMClientError(
+            "base_url and model must be provided from Settings (NEBIUS_BASE_URL, NEBIUS_MODEL).",
+            is_transient=False,
+        )
+    messages = _prompts.build_project_from_folders_messages(folder_summaries)
+    try:
+        content = await _post_messages(messages, api_key, base_url, model, timeout, max_tokens)
+        return _parse_structured_response(content)
+    except httpx.TimeoutException as e:
+        raise LLMClientError(f"LLM API request timed out: {e}", is_transient=True) from e
+    except httpx.NetworkError as e:
+        raise LLMClientError(f"LLM API network error: {e}", is_transient=True) from e

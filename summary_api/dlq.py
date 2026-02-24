@@ -3,15 +3,8 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 from typing import Any
-
-# Default: project root, or set DLQ_PATH in env
-DEFAULT_DLQ_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "DLQ.jsonl",
-)
 
 
 def write_to_dlq(
@@ -32,12 +25,15 @@ def write_to_dlq(
         step_name: Step that failed (e.g. fetch_repo_files, summarize_repo).
         request_summary: Sanitized request info (e.g. github_url; no secrets).
         error_detail: Error message, where, traceback, error_classification.
-        dlq_path: Override path (default from DLQ_PATH env or DEFAULT_DLQ_PATH).
+        dlq_path: Override path (default from Settings.DLQ_PATH).
 
     Returns:
         None. Swallows exceptions so the API response is never broken.
     """
-    path = dlq_path or os.environ.get("DLQ_PATH", DEFAULT_DLQ_PATH)
+    if dlq_path is None:
+        from summary_api.config import get_settings
+        dlq_path = get_settings().DLQ_PATH
+    path = dlq_path
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "correlation_id": correlation_id,

@@ -5,7 +5,10 @@ import pytest
 from summary_api.github_client import RepoFile
 from summary_api.repo_processor import (
     DEFAULT_MAX_CONTEXT_CHARS,
+    ROOT_FOLDER_KEY,
+    group_files_by_top_level_folder,
     process_repo_files,
+    process_repo_files_by_folder,
     should_skip_path,
 )
 
@@ -130,3 +133,65 @@ def test_process_repo_files_priority_readme_first() -> None:
     deep_pos = out.find("deep/nested/file.py")
     assert readme_pos < deep_pos
     assert pyproject_pos < deep_pos
+
+
+# --- group_files_by_top_level_folder and process_repo_files_by_folder ---
+
+
+def test_group_files_by_top_level_folder_root_and_src() -> None:
+    """Root-level files go under (root); src/ files under src."""
+    files = [
+        RepoFile(path="README.md", content="Root"),
+        RepoFile(path="src/main.py", content="def main(): pass"),
+        RepoFile(path="src/foo/bar.py", content="bar"),
+    ]
+    groups = group_files_by_top_level_folder(files)
+    assert ROOT_FOLDER_KEY in groups
+    assert "src" in groups
+    assert len(groups[ROOT_FOLDER_KEY]) == 1
+    assert groups[ROOT_FOLDER_KEY][0].path == "README.md"
+    assert len(groups["src"]) == 2
+
+
+def test_group_files_by_top_level_folder_skips_skipped_paths() -> None:
+    """Skipped paths (e.g. node_modules) are not in any group."""
+    files = [
+        RepoFile(path="README.md", content="x"),
+        RepoFile(path="node_modules/foo/bar.js", content="skip"),
+    ]
+    groups = group_files_by_top_level_folder(files)
+    assert ROOT_FOLDER_KEY in groups
+    assert len(groups[ROOT_FOLDER_KEY]) == 1
+    assert groups[ROOT_FOLDER_KEY][0].path == "README.md"
+
+
+def test_process_repo_files_by_folder_returns_list_of_tuples() -> None:
+    """Output is list of (folder_name, context) sorted by folder name."""
+    files = [
+        RepoFile(path="README.md", content="Root readme."),
+        RepoFile(path="src/main.py", content="def main(): pass"),
+    ]
+    result = process_repo_files_by_folder(files, max_chars_per_folder=2000)
+    assert isinstance(result, list)
+    assert len(result) == 2
+    folder_names = [r[0] for r in result]
+    assert ROOT_FOLDER_KEY in folder_names
+    assert "src" in folder_names
+    assert result[0][0] == ROOT_FOLDER_KEY  # (root) before src alphabetically
+    assert "Repository structure" in result[0][1]
+    assert "Key files" in result[0][1]
+    assert "README.md" in result[0][1]
+    assert "src/main.py" in result[1][1]
+
+
+def test_process_repo_files_by_folder_respects_per_folder_cap() -> None:
+    """Per-folder context length is capped."""
+    big = "x" * 5000
+    files = [
+        RepoFile(path="README.md", content="short"),
+        RepoFile(path="a/large.txt", content=big),
+    ]
+    result = process_repo_files_by_folder(files, max_chars_per_folder=1000)
+    assert len(result) == 2
+    for _name, ctx in result:
+        assert len(ctx) <= 1000 + 200

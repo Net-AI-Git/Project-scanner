@@ -1,9 +1,8 @@
 """Tests for summary_api.github_client: URL parsing, fetch, and error handling (real API when GITHUB_TOKEN set)."""
 
-import os
-
 import pytest
 
+from summary_api.config import get_settings
 from summary_api.github_client import (
     GitHubClientError,
     RepoFile,
@@ -67,8 +66,10 @@ def test_fetch_repo_files_invalid_url_raises() -> None:
 
 # --- fetch_repo_files: real API (require GITHUB_TOKEN) ---
 
+
 def _github_token() -> str | None:
-    t = os.environ.get("GITHUB_TOKEN", "").strip()
+    """GitHub token from Settings (for real API tests)."""
+    t = (get_settings().GITHUB_TOKEN.get_secret_value() or "").strip()
     return t or None
 
 

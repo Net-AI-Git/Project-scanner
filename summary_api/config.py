@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import SecretStr
+from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Resolve .env from project root (parent of summary_api) so it loads regardless of cwd
@@ -30,6 +30,24 @@ class Settings(BaseSettings):
 
     # Optional: GitHub token for higher API rate limit (5000/h vs 60/h). Set GITHUB_TOKEN to run real integration tests.
     GITHUB_TOKEN: SecretStr = SecretStr("")
+
+    # Per-folder context cap when summarizing by folder (default 0 = use DEFAULT_MAX_CONTEXT_CHARS / num_folders in repo_processor).
+    SUMMARY_MAX_CONTEXT_PER_FOLDER: int = 0
+
+    # Paths: audit log and DLQ (append-only files). Defaults = project root when not set in env.
+    AUDIT_LOG_PATH: str = ""
+    DLQ_PATH: str = ""
+    # Logging: set LOG_FORMAT=json for JSON structured logs.
+    LOG_FORMAT: str = ""
+
+    @model_validator(mode="after")
+    def _set_default_paths(self) -> "Settings":
+        """When AUDIT_LOG_PATH or DLQ_PATH are empty, use project root paths."""
+        if not (self.AUDIT_LOG_PATH or "").strip():
+            object.__setattr__(self, "AUDIT_LOG_PATH", str(_PROJECT_ROOT / "AUDIT.jsonl"))
+        if not (self.DLQ_PATH or "").strip():
+            object.__setattr__(self, "DLQ_PATH", str(_PROJECT_ROOT / "DLQ.jsonl"))
+        return self
 
 
 def get_settings() -> Settings:

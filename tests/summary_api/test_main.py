@@ -1,22 +1,22 @@
 """Targeted tests for summary_api.main: root and POST /summarize endpoints (real GitHub + LLM when tokens set)."""
 
-import os
-
 import pytest
 from fastapi.testclient import TestClient
 
+from summary_api.config import get_settings
 from summary_api.main import app
 
 client = TestClient(app)
 
-# Real integration tests require GITHUB_TOKEN for API rate limit (5000/h). Without it they are skipped.
+
 def _has_github_token() -> bool:
-    return bool(os.environ.get("GITHUB_TOKEN", "").strip())
+    """True if GITHUB_TOKEN is set via Settings (for real API rate limit)."""
+    return bool((get_settings().GITHUB_TOKEN.get_secret_value() or "").strip())
 
 
 def _has_llm_key() -> bool:
-    """True if Nebius LLM API key is set (for full summarize flow)."""
-    return bool(os.environ.get("NEBIUS_API_KEY", "").strip())
+    """True if Nebius LLM API key is set via Settings (for full summarize flow)."""
+    return bool((get_settings().NEBIUS_API_KEY.get_secret_value() or "").strip())
 
 
 # --- GET / ---
