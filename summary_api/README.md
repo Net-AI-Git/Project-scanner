@@ -73,7 +73,7 @@ The `POST /summarize` endpoint will be available at `http://localhost:8000/summa
 ```bash
 curl -X POST http://localhost:8000/summarize \
   -H "Content-Type: application/json" \
-  -d "{\"github_url\": \"https://github.com/psf/requests\"}"
+  -d "{\"github_url\": \"https://github.com/Net-AI-Git/Project-scanner\"}"
 ```
 
 You should get HTTP 200 and a JSON body with `summary`, `technologies`, and `structure`.

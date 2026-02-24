@@ -81,7 +81,7 @@ def fetch_repo_files(
     raw content for each file. Stops after max_files to avoid rate limits and timeouts.
 
     Args:
-        github_url: Full URL of the repo, e.g. https://github.com/psf/requests
+        github_url: Full URL of the repo, e.g. https://github.com/Net-AI-Git/Project-scanner
         timeout: Request timeout in seconds.
         max_files: Maximum number of files to fetch (remaining are skipped).
         github_token: Optional GitHub token for higher rate limit (5000/h). From env GITHUB_TOKEN.

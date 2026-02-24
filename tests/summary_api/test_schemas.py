@@ -12,7 +12,7 @@ from summary_api.schemas import ErrorResponse, SummarizeRequest, SummarizeRespon
 def test_summarize_request_happy_path() -> None:
     """SummarizeRequest accepts valid github_url and serializes to expected JSON."""
     # Arrange
-    url = "https://github.com/psf/requests"
+    url = "https://github.com/Net-AI-Git/Project-scanner"
     # Act
     req = SummarizeRequest(github_url=url)
     dumped = req.model_dump()

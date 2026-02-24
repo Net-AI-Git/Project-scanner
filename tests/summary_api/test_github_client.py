@@ -18,7 +18,7 @@ from summary_api.github_client import (
 @pytest.mark.parametrize(
     "url,expected",
     [
-        ("https://github.com/psf/requests", ("psf", "requests")),
+        ("https://github.com/Net-AI-Git/Project-scanner", ("Net-AI-Git", "Project-scanner")),
         ("https://github.com/owner/repo", ("owner", "repo")),
         ("https://github.com/owner/repo/", ("owner", "repo")),
         ("https://github.com/owner/repo.git", ("owner", "repo")),
@@ -92,9 +92,9 @@ def test_fetch_repo_files_404_raises() -> None:
 
 @pytest.mark.skipif(not _github_token(), reason="Set GITHUB_TOKEN to run real GitHub API tests")
 def test_fetch_repo_files_returns_list_of_files() -> None:
-    """Fetching psf/requests returns list of RepoFile with path and content (real API)."""
+    """Fetching Net-AI-Git/Project-scanner returns list of RepoFile with path and content (real API)."""
     files = fetch_repo_files(
-        "https://github.com/psf/requests",
+        "https://github.com/Net-AI-Git/Project-scanner",
         max_files=15,
         github_token=_github_token(),
     )
@@ -112,7 +112,7 @@ def test_fetch_repo_files_returns_list_of_files() -> None:
 def test_fetch_repo_files_includes_readme_content() -> None:
     """At least one file has path containing README and non-empty content (real API)."""
     files = fetch_repo_files(
-        "https://github.com/psf/requests",
+        "https://github.com/Net-AI-Git/Project-scanner",
         max_files=50,
         github_token=_github_token(),
     )

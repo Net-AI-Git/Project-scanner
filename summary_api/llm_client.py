@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any, Literal
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 # Google AI Studio (Gemini) defaults
 GOOGLE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
@@ -112,10 +115,16 @@ def _call_gemini(
     max_tokens: int,
 ) -> dict[str, Any]:
     """Call Google AI Studio (Gemini) generateContent API."""
+    prompt = _build_gemini_prompt(context)
+    logger.info(
+        "=== Sending to LLM (provider=google, model=%s) — full prompt below ===\n%s\n=== end LLM prompt ===",
+        model,
+        prompt,
+    )
     url = f"{base_url.rstrip('/')}/models/{model}:generateContent"
     headers = {"x-goog-api-key": api_key.strip(), "Content-Type": "application/json"}
     payload = {
-        "contents": [{"parts": [{"text": _build_gemini_prompt(context)}]}],
+        "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "maxOutputTokens": max_tokens,
             "temperature": 0.3,
@@ -169,11 +178,17 @@ def _call_nebius(
     max_tokens: int,
 ) -> dict[str, Any]:
     """Call Nebius Token Factory (OpenAI-compatible) chat/completions API."""
+    messages = _build_messages(context)
+    logger.info(
+        "=== Sending to LLM (provider=nebius, model=%s) — full messages below ===\n%s\n=== end LLM messages ===",
+        model,
+        json.dumps([{"role": m["role"], "content": m["content"]} for m in messages], ensure_ascii=False, indent=2),
+    )
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": model,
-        "messages": _build_messages(context),
+        "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.3,
         "response_format": {"type": "json_object"},

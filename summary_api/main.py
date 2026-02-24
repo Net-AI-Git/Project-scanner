@@ -1,16 +1,25 @@
 """FastAPI application: POST /summarize — full flow: GitHub → repo_processor → LLM → response."""
 
-from fastapi import FastAPI
+import logging
+import time
+import uuid
+
+from fastapi import FastAPI, Response
+
+# Ensure LLM payload logs (what we send before each call) are visible when server runs
+logging.getLogger("summary_api.llm_client").setLevel(logging.INFO)
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 try:
+    from .audit import error_detail_from_exception, log_audit, log_audit_step
     from .config import get_settings
     from .github_client import GitHubClientError, fetch_repo_files
     from .llm_client import LLMClientError, summarize_repo
     from .repo_processor import process_repo_files
     from .schemas import SummarizeRequest, SummarizeResponse
 except ImportError:
+    from audit import error_detail_from_exception, log_audit, log_audit_step
     from config import get_settings
     from github_client import GitHubClientError, fetch_repo_files
     from llm_client import LLMClientError, summarize_repo
@@ -88,42 +97,146 @@ def root() -> dict[str, str]:
     }
 
 
+def _audit(request_github_url: str, correlation_id: str, result: str, status_code: int, message: str | None = None) -> None:
+    """Write one audit entry; swallow errors so response is never broken."""
+    try:
+        meta = {"github_url": request_github_url, "status_code": status_code}
+        if message:
+            meta["message"] = message
+        log_audit(
+            event_type="api_request",
+            resource="/summarize",
+            action="POST",
+            result=result,
+            correlation_id=correlation_id,
+            metadata=meta,
+        )
+    except Exception:
+        pass
+
+
+def _with_correlation_header(content: dict, status: int, correlation_id: str) -> JSONResponse:
+    """Build JSONResponse with X-Correlation-ID for LLM-as-Judge trace lookup."""
+    return JSONResponse(status_code=status, content=content, headers={"X-Correlation-ID": correlation_id})
+
+
 @app.post("/summarize", response_model=SummarizeResponse)
-def summarize(request: SummarizeRequest) -> SummarizeResponse | JSONResponse:
+def summarize(request: SummarizeRequest, response: Response) -> SummarizeResponse | JSONResponse:
     """Full flow: fetch repo → process context → LLM summarize → return JSON per spec."""
+    correlation_id = str(uuid.uuid4())
     settings = get_settings()
     github_token = settings.GITHUB_TOKEN.get_secret_value() or None
 
+    # Step 1: fetch_repo_files
+    t0 = time.perf_counter()
     try:
         files = fetch_repo_files(request.github_url, github_token=github_token)
+        duration_ms = (time.perf_counter() - t0) * 1000
+        if not files:
+            log_audit_step(
+                correlation_id,
+                "fetch_repo_files",
+                "failure",
+                step_index=1,
+                input_summary={"github_url": request.github_url, "has_token": bool(github_token)},
+                output_summary={"file_count": 0},
+                error_detail={"message": "Repository is empty or has no readable files", "where": "summary_api.main.summarize"},
+                duration_ms=duration_ms,
+            )
+            _audit(request.github_url, correlation_id, "failure", 404, "Repository is empty or has no readable files")
+            return _with_correlation_header(
+                {"status": "error", "message": "Repository is empty or has no readable files"},
+                404,
+                correlation_id,
+            )
+        log_audit_step(
+            correlation_id,
+            "fetch_repo_files",
+            "success",
+            step_index=1,
+            input_summary={"github_url": request.github_url, "has_token": bool(github_token)},
+            output_summary={"file_count": len(files)},
+            duration_ms=duration_ms,
+        )
     except GitHubClientError as e:
+        duration_ms = (time.perf_counter() - t0) * 1000
+        log_audit_step(
+            correlation_id,
+            "fetch_repo_files",
+            "failure",
+            step_index=1,
+            input_summary={"github_url": request.github_url, "has_token": bool(github_token)},
+            error_detail=error_detail_from_exception(e, "summary_api.github_client.fetch_repo_files"),
+            duration_ms=duration_ms,
+        )
         status, message = _github_error_to_status_and_message(e)
-        return JSONResponse(
-            status_code=status,
-            content={"status": "error", "message": message},
-        )
+        _audit(request.github_url, correlation_id, "failure", status, message)
+        return _with_correlation_header({"status": "error", "message": message}, status, correlation_id)
 
-    if not files:
-        return JSONResponse(
-            status_code=404,
-            content={
-                "status": "error",
-                "message": "Repository is empty or has no readable files",
-            },
+    # Step 2: process_repo_files
+    t1 = time.perf_counter()
+    try:
+        context = process_repo_files(files)
+        duration_ms = (time.perf_counter() - t1) * 1000
+        log_audit_step(
+            correlation_id,
+            "process_repo_files",
+            "success",
+            step_index=2,
+            input_summary={"file_count": len(files)},
+            output_summary={"context_length": len(context)},
+            duration_ms=duration_ms,
         )
+    except Exception as e:
+        duration_ms = (time.perf_counter() - t1) * 1000
+        log_audit_step(
+            correlation_id,
+            "process_repo_files",
+            "failure",
+            step_index=2,
+            input_summary={"file_count": len(files)},
+            error_detail=error_detail_from_exception(e, "summary_api.repo_processor.process_repo_files"),
+            duration_ms=duration_ms,
+        )
+        _audit(request.github_url, correlation_id, "failure", 500, str(e))
+        return _with_correlation_header({"status": "error", "message": str(e)}, 500, correlation_id)
 
-    context = process_repo_files(files)
+    # Step 3: summarize_repo (LLM)
     provider, api_key = _get_llm_provider_and_key(settings)
-
+    t2 = time.perf_counter()
     try:
         result = summarize_repo(context, api_key=api_key, provider=provider)
-    except LLMClientError as e:
-        status, message = _llm_error_to_status_and_message(e)
-        return JSONResponse(
-            status_code=status,
-            content={"status": "error", "message": message},
+        duration_ms = (time.perf_counter() - t2) * 1000
+        log_audit_step(
+            correlation_id,
+            "summarize_repo",
+            "success",
+            step_index=3,
+            input_summary={"context_length": len(context), "provider": provider},
+            output_summary={
+                "summary_length": len(result.get("summary", "") or ""),
+                "technologies_count": len(result.get("technologies") or []),
+                "structure_length": len(result.get("structure", "") or ""),
+            },
+            duration_ms=duration_ms,
         )
+    except LLMClientError as e:
+        duration_ms = (time.perf_counter() - t2) * 1000
+        log_audit_step(
+            correlation_id,
+            "summarize_repo",
+            "failure",
+            step_index=3,
+            input_summary={"context_length": len(context), "provider": provider},
+            error_detail=error_detail_from_exception(e, "summary_api.llm_client.summarize_repo"),
+            duration_ms=duration_ms,
+        )
+        status, message = _llm_error_to_status_and_message(e)
+        _audit(request.github_url, correlation_id, "failure", status, message)
+        return _with_correlation_header({"status": "error", "message": message}, status, correlation_id)
 
+    _audit(request.github_url, correlation_id, "success", 200)
+    response.headers["X-Correlation-ID"] = correlation_id
     return SummarizeResponse(
         summary=result.get("summary", "") or "",
         technologies=result.get("technologies") or [],

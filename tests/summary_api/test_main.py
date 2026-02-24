@@ -50,7 +50,7 @@ def test_root_returns_json_with_message_and_docs() -> None:
 )
 def test_summarize_happy_path_real_api() -> None:
     """POST /summarize with valid github_url: real GitHub + LLM. 200 + spec fields, or 429 (rate limit) + error body."""
-    response = client.post("/summarize", json={"github_url": "https://github.com/psf/requests"})
+    response = client.post("/summarize", json={"github_url": "https://github.com/Net-AI-Git/Project-scanner"})
     data = response.json()
     if response.status_code == 200:
         assert "summary" in data, "Response must contain 'summary'"

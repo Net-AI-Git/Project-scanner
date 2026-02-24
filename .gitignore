@@ -18,6 +18,9 @@ pytest-cache-files-*
 venv/
 env/
 
+# Audit log (append-only; may contain request URLs/messages)
+AUDIT.jsonl
+
 # Explore / local scripts (not part of main app)
 explore_github_api/
 
