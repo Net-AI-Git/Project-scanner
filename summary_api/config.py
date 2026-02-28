@@ -45,8 +45,14 @@ class Settings(BaseSettings):
     SUMMARY_MAX_CHARS_COUNT_PER_FILE: int = 25_000
     # Decider: stop when this fraction of eligible files is covered (e.g. 0.8 = 80%).
     SUMMARY_COVERAGE_THRESHOLD: float = 0.8
-    # Decider: use LLM for "enough?" decision (default False = heuristic).
-    DECIDER_USE_LLM: bool = False
+    # Decider: use LLM to ask "does latest batch change what the project does?" (default True).
+    # Set to False to use word-overlap heuristic instead (less accurate for early stop).
+    DECIDER_USE_LLM: bool = True
+
+    # Structure-then-batch flow: parallel blob fetch and LLM planning limits.
+    BATCH_FETCH_MAX_CONCURRENCY: int = 25
+    PLAN_BATCHES_MAX_BATCHES: int = 20
+    PLAN_BATCHES_MAX_PATHS: int = 2000
 
     # Paths: audit log and DLQ (append-only files). Defaults = project root when not set in env.
     AUDIT_LOG_PATH: str = ""

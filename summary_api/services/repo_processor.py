@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import List, Sequence, Tuple
+from typing import Any, List, Sequence, Tuple
 
 from summary_api.clients.github_client import RepoFile
 
@@ -137,6 +137,100 @@ def _file_priority(path: str) -> int:
         return 3
     # Deeper files: 4+
     return 4 + min(dir_depth, 5)
+
+
+def _folder_sort_key(folder_name: str) -> tuple[int, str]:
+    """Order folders: (root) first, then alphabetical."""
+    if folder_name == ROOT_FOLDER_KEY:
+        return (0, "")
+    return (1, folder_name)
+
+
+def _subfolder_key(path: str) -> str:
+    """Second path segment for splitting large top-level folders; root files stay in (root)."""
+    segments = _path_segments(path)
+    if len(segments) <= 2:
+        return path
+    return "/".join(segments[:2])
+
+
+def partition_into_batches(
+    paths: List[str],
+    settings: Any,
+    path_to_size: dict[str, int] | None = None,
+) -> List[List[str]]:
+    """Partition paths into batches by semantic structure (top-level folder, then subfolder if needed).
+
+    Groups by top-level folder (reuse _top_level_folder). Orders batches: (root) first, then
+    other folders. If a folder exceeds max_chars or max_files, splits by subfolder. Uses
+    _file_priority for ordering paths within each group.
+
+    Args:
+        paths: Eligible file paths (already filtered with should_skip_path).
+        settings: Settings with SUMMARY_MAX_CONTEXT_CHARS_PER_BATCH, SUMMARY_MAX_FILES_PER_BATCH,
+            SUMMARY_MAX_CHARS_COUNT_PER_FILE (optional, for effective size cap).
+        path_to_size: Optional map path -> byte/size for respecting context budget when splitting.
+
+    Returns:
+        Ordered list of batches; each batch is a list of paths.
+    """
+    if not paths:
+        return []
+    max_chars = getattr(settings, "SUMMARY_MAX_CONTEXT_CHARS_PER_BATCH", 50_000)
+    max_files = getattr(settings, "SUMMARY_MAX_FILES_PER_BATCH", 50)
+    max_chars_per_file = getattr(settings, "SUMMARY_MAX_CHARS_COUNT_PER_FILE", 25_000)
+
+    def effective_size(p: str) -> int:
+        if path_to_size and p in path_to_size:
+            sz = path_to_size[p]
+            return min(sz, max_chars_per_file) if max_chars_per_file > 0 else sz
+        return 0
+
+    groups: dict[str, List[str]] = {}
+    for p in paths:
+        folder = _top_level_folder(p)
+        if folder not in groups:
+            groups[folder] = []
+        groups[folder].append(p)
+
+    for folder in groups:
+        groups[folder].sort(key=lambda x: (_file_priority(x), x))
+
+    batches: List[List[str]] = []
+    for folder_name in sorted(groups.keys(), key=_folder_sort_key):
+        group_paths = groups[folder_name]
+        if not group_paths:
+            continue
+        total_size = sum(effective_size(p) for p in group_paths) if path_to_size else 0
+        if (
+            len(group_paths) <= max_files
+            and (not path_to_size or total_size <= max_chars)
+        ):
+            batches.append(group_paths)
+            continue
+        subgroups: dict[str, List[str]] = {}
+        for p in group_paths:
+            key = _subfolder_key(p)
+            if key not in subgroups:
+                subgroups[key] = []
+            subgroups[key].append(p)
+        for subkey in sorted(subgroups.keys()):
+            subpaths = subgroups[subkey]
+            subpaths.sort(key=lambda x: (_file_priority(x), x))
+            current: List[str] = []
+            current_size = 0
+            for p in subpaths:
+                sz = effective_size(p) if path_to_size else max_chars // max(len(subpaths), 1)
+                if current and (len(current) >= max_files or (path_to_size and current_size + sz > max_chars)):
+                    batches.append(current)
+                    current = []
+                    current_size = 0
+                current.append(p)
+                if path_to_size:
+                    current_size += sz
+            if current:
+                batches.append(current)
+    return batches
 
 
 def _build_directory_tree(paths: List[str], max_entries: int = 200) -> str:

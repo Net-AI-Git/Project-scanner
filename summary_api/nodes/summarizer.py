@@ -7,7 +7,6 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from summary_api.infrastructure.audit import log_audit_step
-from summary_api.clients.github_client import RepoFile
 from summary_api.clients.llm_client import LLMClientError, summarize_batch
 from summary_api.services.repo_processor import _build_context_for_files  # noqa: PLC2701
 
@@ -15,12 +14,6 @@ if TYPE_CHECKING:
     from summary_api.models.state import SummaryGraphState
 
 logger = logging.getLogger(__name__)
-
-
-def _files_for_paths(all_repo_files: list[RepoFile], paths: list[str]) -> list[RepoFile]:
-    """Return RepoFile list for given paths; order preserved."""
-    path_to_file = {f.path: f for f in all_repo_files if f.path}
-    return [path_to_file[p] for p in paths if p in path_to_file]
 
 
 def _llm_kwargs_from_settings(settings: Any) -> dict[str, Any]:
@@ -37,11 +30,11 @@ def _llm_kwargs_from_settings(settings: Any) -> dict[str, Any]:
 
 
 async def summarizer_node(state: SummaryGraphState, settings: Any) -> dict[str, Any]:
-    """READ current_batch_paths, all_repo_files; DO context + LLM; WRITE append summarized_chunks, extend already_summarized_paths."""
+    """READ current_batch_paths, current_batch_files; DO context + LLM; WRITE append summarized_chunks, extend already_summarized_paths."""
     t0 = time.perf_counter()
     correlation_id = state.get("correlation_id") or ""
     current_paths = state.get("current_batch_paths") or []
-    all_files = state.get("all_repo_files") or []
+    batch_files = state.get("current_batch_files") or []
     chunks = list(state.get("summarized_chunks") or [])
     already = list(state.get("already_summarized_paths") or [])
 
@@ -50,7 +43,12 @@ async def summarizer_node(state: SummaryGraphState, settings: Any) -> dict[str, 
         log_audit_step(correlation_id, "summarizer", "success", output_summary={"skipped": True}, duration_ms=duration_ms)
         return {}
 
-    batch_files = _files_for_paths(all_files, current_paths)
+    if not batch_files:
+        duration_ms = (time.perf_counter() - t0) * 1000
+        log_audit_step(correlation_id, "summarizer", "success", output_summary={"skipped": True, "reason": "empty_batch_files"}, duration_ms=duration_ms)
+        chunks.append({"paths": current_paths, "summary": "(No text content in this batch.)"})
+        already.extend(current_paths)
+        return {"summarized_chunks": chunks, "already_summarized_paths": already}
     max_chars = getattr(settings, "SUMMARY_MAX_CONTEXT_CHARS_PER_BATCH", 50_000)
     context = _build_context_for_files(batch_files, max_chars)
     batch_label = ", ".join(current_paths[:3]) + ("..." if len(current_paths) > 3 else "")
@@ -72,8 +70,8 @@ async def summarizer_node(state: SummaryGraphState, settings: Any) -> dict[str, 
     duration_ms = (time.perf_counter() - t0) * 1000
     log_audit_step(
         correlation_id, "summarizer", "success",
-        input_summary={"batch_size": len(current_paths)},
-        output_summary={"summary_length": len(summary_text)},
+        input_summary={"batch_size": len(current_paths), "paths_sample": current_paths[:5]},
+        output_summary={"summary_length": len(summary_text), "summary": summary_text},
         duration_ms=duration_ms,
     )
     return {"summarized_chunks": chunks, "already_summarized_paths": already}

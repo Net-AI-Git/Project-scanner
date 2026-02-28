@@ -117,36 +117,8 @@ def _parse_folder_summary_response(content: str) -> dict[str, Any]:
     return {"summary": summary}
 
 
-async def _post_messages(
-    messages: list[dict[str, str]],
-    api_key: str,
-    base_url: str,
-    model: str,
-    timeout: float,
-    max_tokens: int,
-) -> str:
-    """Send messages to Nebius chat/completions; return raw content string. Shared by repo/folder/project calls."""
-    logger.info(
-        "=== Sending to LLM (provider=nebius, model=%s) — full messages below ===\n%s\n=== end LLM messages ===",
-        model,
-        json.dumps(
-            [{"role": m["role"], "content": m["content"]} for m in messages],
-            ensure_ascii=False,
-            indent=2,
-        ),
-    )
-    url = base_url.rstrip("/") + "/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": 0.3,
-        "response_format": {"type": "json_object"},
-    }
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(url, json=payload, headers=headers)
-
+def _parse_chat_response_content(response: httpx.Response) -> str:
+    """Extract content string from chat completion response; raise LLMClientError on bad status or body."""
     if response.status_code == 401:
         raise LLMClientError(
             "LLM API authentication failed (invalid or missing API key).",
@@ -170,7 +142,6 @@ async def _post_messages(
         except Exception:
             msg = response.text or f"HTTP {response.status_code}"
         raise LLMClientError(f"LLM API error: {msg}", is_transient=False)
-
     try:
         data = response.json()
     except Exception as e:
@@ -199,6 +170,40 @@ async def _post_messages(
     if not isinstance(content, str):
         content = str(content)
     return content
+
+
+async def _post_messages(
+    messages: list[dict[str, str]],
+    api_key: str,
+    base_url: str,
+    model: str,
+    timeout: float,
+    max_tokens: int,
+    response_format_json: bool = True,
+) -> str:
+    """Send messages to Nebius chat/completions; return raw content string. Shared by repo/folder/project/decider calls."""
+    logger.info(
+        "=== Sending to LLM (provider=nebius, model=%s) — full messages below ===\n%s\n=== end LLM messages ===",
+        model,
+        json.dumps(
+            [{"role": m["role"], "content": m["content"]} for m in messages],
+            ensure_ascii=False,
+            indent=2,
+        ),
+    )
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0.3,
+    }
+    if response_format_json:
+        payload["response_format"] = {"type": "json_object"}
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(url, json=payload, headers=headers)
+    return _parse_chat_response_content(response)
 
 
 async def _call_nebius(
@@ -401,3 +406,112 @@ async def summarize_project_from_folders(
         raise LLMClientError(f"LLM API request timed out: {e}", is_transient=True) from e
     except httpx.NetworkError as e:
         raise LLMClientError(f"LLM API network error: {e}", is_transient=True) from e
+
+
+async def decide_continue_or_done(
+    previous_summaries: list[str],
+    current_summary: str,
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    timeout: float = DEFAULT_TIMEOUT,
+    max_tokens: int = 32,
+) -> str:
+    """Call LLM to decide whether the latest batch summary adds enough new information to continue.
+
+    Returns "continue" or "done". Uses plain-text response (no JSON) so the model can reply with one word.
+    """
+    if not (api_key or "").strip():
+        raise LLMClientError(
+            "LLM API key is not configured. Set NEBIUS_API_KEY in the environment.",
+            is_transient=False,
+        )
+    if not (base_url or "").strip() or not (model or "").strip():
+        raise LLMClientError(
+            "base_url and model must be provided from Settings (NEBIUS_BASE_URL, NEBIUS_MODEL).",
+            is_transient=False,
+        )
+    messages = _prompts.build_decider_messages(previous_summaries, current_summary)
+    content = await _post_messages(
+        messages, api_key, base_url, model, timeout, max_tokens, response_format_json=False
+    )
+    text = (content or "").strip().lower()
+    if "done" in text:
+        return "done"
+    return "continue"
+
+
+def _parse_plan_batches_response(
+    content: str, allowed_paths: set[str], max_batches: int
+) -> list[list[str]]:
+    """Parse LLM plan-batches response to list of path batches. Validates paths are in allowed_paths; truncates to max_batches."""
+    if not (content or "").strip():
+        return []
+    text = content.strip()
+    code_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if code_match:
+        text = code_match.group(1).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    raw = data.get("batches")
+    if not isinstance(raw, list):
+        return []
+    batches: list[list[str]] = []
+    for batch in raw[:max_batches]:
+        if not isinstance(batch, list):
+            continue
+        valid = [p for p in batch if isinstance(p, str) and p in allowed_paths]
+        if valid:
+            batches.append(valid)
+    return batches
+
+
+@circuit(failure_threshold=5, recovery_timeout=60, expected_exception=LLMClientError)
+@retry(
+    retry=retry_if_exception(_is_llm_transient),
+    stop=stop_after_attempt(RETRY_ATTEMPTS),
+    wait=wait_random_exponential(multiplier=1, min=RETRY_MIN_WAIT, max=RETRY_MAX_WAIT),
+    reraise=True,
+)
+async def plan_batches_from_structure(
+    structure_text: str,
+    paths: list[str],
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    timeout: float = DEFAULT_TIMEOUT,
+    max_tokens: int = 8192,
+    max_batches: int = 20,
+) -> list[list[str]]:
+    """Call LLM to plan batches from repo structure; returns ordered list of path batches (subset of paths)."""
+    if not (api_key or "").strip():
+        raise LLMClientError(
+            "LLM API key is not configured. Set NEBIUS_API_KEY in the environment.",
+            is_transient=False,
+        )
+    if not (base_url or "").strip() or not (model or "").strip():
+        raise LLMClientError(
+            "base_url and model must be provided from Settings (NEBIUS_BASE_URL, NEBIUS_MODEL).",
+            is_transient=False,
+        )
+    allowed = set(paths)
+    messages = _prompts.build_plan_batches_messages(structure_text, paths)
+    try:
+        content = await _post_messages(
+            messages, api_key, base_url, model, timeout, max_tokens
+        )
+        return _parse_plan_batches_response(content, allowed, max_batches)
+    except httpx.TimeoutException as e:
+        raise LLMClientError(
+            f"LLM API request timed out: {e}", is_transient=True
+        ) from e
+    except httpx.NetworkError as e:
+        raise LLMClientError(
+            f"LLM API network error: {e}", is_transient=True
+        ) from e

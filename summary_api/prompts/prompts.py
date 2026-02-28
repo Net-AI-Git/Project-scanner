@@ -117,3 +117,113 @@ def build_project_from_folders_messages(folder_summaries: list[dict[str, str]]) 
         {"role": "system", "content": PROJECT_SYSTEM_PROMPT},
         {"role": "user", "content": PROJECT_USER_PROMPT_TEMPLATE.format(folder_summaries=blob)},
     ]
+
+
+# --- Plan batches: given repo structure, choose files and split into batches by priority ---
+
+PLAN_BATCHES_SYSTEM_PROMPT = """You are a planner for a repository summarization workflow. You will receive:
+1) A directory tree of a repository (filtered: no node_modules, lock files, binaries, etc.).
+2) The full list of file paths in that tree.
+
+Your task: Choose which files are needed to understand what this repository does (purpose, main functionality, technologies). Then split those files into batches ordered by importance. Each batch will be sent to a summarizer one after the other.
+
+Rules:
+- Use ONLY paths from the provided list. Do not invent paths.
+- Order batches by priority: first batch = most important (e.g. README, root config, main entry points); later batches = supporting or secondary (tests, docs, other modules).
+- Keep batches small enough for a single LLM context (e.g. up to ~30–50 files per batch, or fewer if files are large).
+- Reply with valid JSON only. No markdown code fences, no explanation outside the JSON.
+
+Format:
+{"batches": [["path1", "path2", ...], ["path3", ...], ...]}
+
+Example: {"batches": [["README.md", "package.json", "src/index.js"], ["src/utils.js", "src/api.js"], ["tests/unit.js"]]}"""
+
+PLAN_BATCHES_USER_PROMPT_TEMPLATE = """Repository directory structure:
+
+<structure>
+{structure_text}
+</structure>
+
+Full list of eligible file paths (use only these paths in your reply):
+
+<paths>
+{paths_list}
+</paths>
+
+Produce JSON with key "batches": a list of batches, each batch a list of paths from the above list, ordered by priority (first batch = highest priority)."""
+
+
+def build_plan_batches_messages(structure_text: str, paths: list[str]) -> list[dict[str, str]]:
+    """Build system + user messages for LLM to plan batches from repo structure.
+
+    Args:
+        structure_text: ASCII directory tree (e.g. from _build_directory_tree).
+        paths: Full list of eligible file paths; LLM must use only these in batches.
+
+    Returns:
+        List of dicts with role and content for chat completion.
+    """
+    paths_list = "\n".join(paths) if paths else "(no paths)"
+    return [
+        {"role": "system", "content": PLAN_BATCHES_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": PLAN_BATCHES_USER_PROMPT_TEMPLATE.format(
+                structure_text=structure_text,
+                paths_list=paths_list,
+            ),
+        },
+    ]
+
+
+# --- Decider: does the latest batch change our understanding of what the project DOES? ---
+
+DECIDER_SYSTEM_PROMPT = """You are a judge for a repository summarization workflow. You will see:
+1) Previous batch summaries (so far) — they already tell us something about the project.
+2) The latest batch summary just produced.
+
+Your task: Does the latest batch summary CHANGE our understanding of WHAT THIS PROJECT DOES?
+By "what the project does" we mean: its purpose, main functionality, what problem it solves, or who it is for.
+
+Answer with exactly one word: "continue" or "done".
+- "done" = the latest summary does NOT change what the project does. For example: it only adds meta/process info (documentation, CI/CD, GitHub config, license, contributing guidelines, tests, certificates) and the core "what this project does" was already clear from previous summaries. We have enough to synthesize.
+- "continue" = the latest summary DOES change or materially add to our understanding of what the project does (e.g. new core features, main components, or purpose we did not know before).
+
+Reply with only the word, no explanation."""
+
+DECIDER_USER_PROMPT_TEMPLATE = """Previous batch summaries:
+
+<previous>
+{previous_summaries}
+</previous>
+
+Latest batch summary:
+
+<latest>
+{current_summary}
+</latest>
+
+Does the latest change our understanding of what this project DOES? Answer: continue or done?"""
+
+
+def build_decider_messages(previous_summaries: list[str], current_summary: str) -> list[dict[str, str]]:
+    """Build system + user messages for Decider (continue or done based on content).
+
+    Args:
+        previous_summaries: Concatenated or list of prior batch summary texts.
+        current_summary: The latest batch summary text.
+
+    Returns:
+        List of dicts with role and content for chat completion.
+    """
+    previous_blob = "\n\n".join(previous_summaries) if previous_summaries else "(none yet)"
+    return [
+        {"role": "system", "content": DECIDER_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": DECIDER_USER_PROMPT_TEMPLATE.format(
+                previous_summaries=previous_blob,
+                current_summary=current_summary or "",
+            ),
+        },
+    ]
