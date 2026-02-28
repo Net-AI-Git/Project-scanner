@@ -12,18 +12,20 @@ __pycache__/
 *.pyo
 .pytest_cache/
 pytest-cache-files-*
-tests/
+**/tests/
 
 # Virtual environment
 .venv/
 venv/
 env/
 
-# Audit log (append-only; may contain request URLs/messages)
-AUDIT.jsonl
+# Audit log and DLQ (append-only; may contain request URLs/messages) — any path
+**/AUDIT.jsonl
+**/DLQ.jsonl
 
 # Explore / local scripts (not part of main app)
 explore_github_api/
+**/scripts/
 
 # Task documents (local / draft)
 TASK_BREAKDOWN.md

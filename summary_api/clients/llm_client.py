@@ -25,7 +25,7 @@ RETRY_ATTEMPTS = 3
 RETRY_MIN_WAIT = 1
 RETRY_MAX_WAIT = 60
 
-from . import prompts as _prompts
+from summary_api.prompts import prompts as _prompts
 
 class LLMClientError(Exception):
     """Raised when the LLM API call fails.
@@ -314,6 +314,47 @@ async def summarize_folder(
             is_transient=False,
         )
     messages = _prompts.build_folder_summary_messages(folder_name, context)
+    try:
+        content = await _post_messages(messages, api_key, base_url, model, timeout, max_tokens)
+        return _parse_folder_summary_response(content)
+    except httpx.TimeoutException as e:
+        raise LLMClientError(f"LLM API request timed out: {e}", is_transient=True) from e
+    except httpx.NetworkError as e:
+        raise LLMClientError(f"LLM API network error: {e}", is_transient=True) from e
+
+
+@circuit(failure_threshold=5, recovery_timeout=60, expected_exception=LLMClientError)
+@retry(
+    retry=retry_if_exception(_is_llm_transient),
+    stop=stop_after_attempt(RETRY_ATTEMPTS),
+    wait=wait_random_exponential(multiplier=1, min=RETRY_MIN_WAIT, max=RETRY_MAX_WAIT),
+    reraise=True,
+)
+async def summarize_batch(
+    context: str,
+    batch_label: str,
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    timeout: float = DEFAULT_TIMEOUT,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> dict[str, Any]:
+    """Call LLM to summarize one batch of file context; returns dict with key 'summary'.
+
+    Used by the 4-node graph Summarizer node. Same retry and circuit breaker as summarize_folder.
+    """
+    if not (api_key or "").strip():
+        raise LLMClientError(
+            "LLM API key is not configured. Set NEBIUS_API_KEY in the environment.",
+            is_transient=False,
+        )
+    if not (base_url or "").strip() or not (model or "").strip():
+        raise LLMClientError(
+            "base_url and model must be provided from Settings (NEBIUS_BASE_URL, NEBIUS_MODEL).",
+            is_transient=False,
+        )
+    messages = _prompts.build_batch_summary_messages(batch_label, context)
     try:
         content = await _post_messages(messages, api_key, base_url, model, timeout, max_tokens)
         return _parse_folder_summary_response(content)

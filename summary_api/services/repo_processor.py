@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import List, Sequence, Tuple
 
-from .github_client import RepoFile
+from summary_api.clients.github_client import RepoFile
 
 # Root-level files (no path segment) go under this key.
 ROOT_FOLDER_KEY = "(root)"
@@ -18,9 +18,10 @@ SKIP_DIRS = frozenset({
     "node_modules", "__pycache__", ".git", "venv", ".venv", "env", ".env",
     "dist", "build", ".eggs", ".tox", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     "vendor", "pods", ".idea", ".vscode", "coverage", "htmlcov", ".nx", ".turbo",
+    "target", "bower_components", ".cache", "cache",
 })
 
-# File name patterns to skip: lock files, minified, source maps, large binaries.
+# File name patterns to skip: lock files, minified, source maps, binary files (per task: binary/lock/node_modules).
 SKIP_FILE_PATTERNS = (
     re.compile(r"\.(min\.(js|css))$", re.I),
     re.compile(r"\.(map)$", re.I),
@@ -31,6 +32,21 @@ SKIP_FILE_PATTERNS = (
     re.compile(r"Cargo\.lock$", re.I),
     re.compile(r"composer\.lock$", re.I),
     re.compile(r"\.lock$", re.I),
+    # Binary / non-text: images, fonts, executables, compiled (task: binary files must be skipped).
+    re.compile(r"\.(png|jpe?g|gif|webp|ico|bmp)$", re.I),
+    re.compile(r"\.(woff2?|ttf|eot|otf)$", re.I),
+    re.compile(r"\.(pdf|pyc|so|dll|exe|class|jar)$", re.I),
+    # Extra lock/deps: pnpm, bun, Ruby, Go checksums.
+    re.compile(r"pnpm-lock\.yaml$", re.I),
+    re.compile(r"bun\.lock(b)?$", re.I),
+    re.compile(r"Gemfile\.lock$", re.I),
+    re.compile(r"go\.sum$", re.I),
+    # Build artifacts: Rust, TypeScript, WebAssembly.
+    re.compile(r"\.(rlib|rmeta|tsbuildinfo|wasm)$", re.I),
+    # Data / DB (not source).
+    re.compile(r"\.(sqlite|db)$", re.I),
+    # Logs and temp.
+    re.compile(r"\.(log|tmp|temp)$", re.I),
 )
 
 # High-priority files (included first): README, LICENSE, config at root or anywhere.
@@ -62,7 +78,11 @@ def _top_level_folder(path: str) -> str:
 
 
 def should_skip_path(path: str) -> bool:
-    """Return True if this path should be skipped (binary dirs, lock files, etc.)."""
+    """Return True if this path should be skipped (binary dirs, lock files, binary files, etc.).
+
+    Aligns with task: binary files, lock files, node_modules/ and similar must not be sent to the LLM.
+    Applied early after fetch so skipped paths never enter the graph or selection pool.
+    """
     segments = _path_segments(path)
     for seg in segments[:-1]:  # directories only
         seg_lower = seg.lower()

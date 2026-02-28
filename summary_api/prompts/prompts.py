@@ -54,6 +54,37 @@ def build_folder_summary_messages(folder_name: str, context: str) -> list[dict[s
     ]
 
 
+# --- Batch summary: one batch of file context → short summary (4-node graph Summarizer) ---
+
+BATCH_SUMMARY_SYSTEM_PROMPT = """You are a technical writer. Given the contents of a batch of repository files, produce one short explanatory summary in JSON format with a single key "summary". Describe what these files contain and their role in the project. Be concise (2-4 sentences). No markdown code fences.
+
+Format: {"summary": "Your concise summary here."}"""
+
+BATCH_SUMMARY_USER_PROMPT_TEMPLATE = """Summarize this batch of repository files.
+
+<batch>{batch_label}</batch>
+
+<context>
+{context}
+</context>"""
+
+
+def build_batch_summary_messages(batch_label: str, context: str) -> list[dict[str, str]]:
+    """Build system + user messages for batch summarization (Summarizer node).
+
+    Args:
+        batch_label: Short label for the batch (e.g. paths or "batch 1").
+        context: Prepared context string for the batch.
+
+    Returns:
+        List of dicts with role and content for chat completion.
+    """
+    return [
+        {"role": "system", "content": BATCH_SUMMARY_SYSTEM_PROMPT},
+        {"role": "user", "content": BATCH_SUMMARY_USER_PROMPT_TEMPLATE.format(batch_label=batch_label, context=context)},
+    ]
+
+
 # --- Project from folders: list of folder summaries → final summary, technologies, structure ---
 
 PROJECT_SYSTEM_PROMPT = """You are a technical writer. Given per-folder summaries of a repository, produce a single project summary in the exact JSON format below. Use only the keys "summary", "technologies", and "structure". No other keys or markdown code fences.

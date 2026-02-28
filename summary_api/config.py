@@ -34,6 +34,20 @@ class Settings(BaseSettings):
     # Per-folder context cap when summarizing by folder (default 0 = use DEFAULT_MAX_CONTEXT_CHARS / num_folders in repo_processor).
     SUMMARY_MAX_CONTEXT_PER_FOLDER: int = 0
 
+    # 4-node graph: batch by character budget and cap; hard iteration limit (multi-agent mandate).
+    SUMMARY_BATCH_SIZE: int = 30
+    SUMMARY_MAX_ITERATIONS: int = 20
+    # Context-safe batching: fill batch until this many chars (or max files). Default 50k leaves room for prompt.
+    SUMMARY_MAX_CONTEXT_CHARS_PER_BATCH: int = 50_000
+    SUMMARY_MAX_FILES_PER_BATCH: int = 50
+    # Cap each file's "count" when filling batch so one huge file does not force a 1-file batch (more LLM calls).
+    # E.g. 25_000 => at least 2 large files per batch; Summarizer truncates. 0 = no cap.
+    SUMMARY_MAX_CHARS_COUNT_PER_FILE: int = 25_000
+    # Decider: stop when this fraction of eligible files is covered (e.g. 0.8 = 80%).
+    SUMMARY_COVERAGE_THRESHOLD: float = 0.8
+    # Decider: use LLM for "enough?" decision (default False = heuristic).
+    DECIDER_USE_LLM: bool = False
+
     # Paths: audit log and DLQ (append-only files). Defaults = project root when not set in env.
     AUDIT_LOG_PATH: str = ""
     DLQ_PATH: str = ""
