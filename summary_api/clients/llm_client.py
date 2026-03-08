@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+from importlib.resources import files
 from typing import Any
 
 import httpx
 from circuitbreaker import circuit
+from jinja2 import Template
 from tenacity import (
     retry,
     retry_if_exception,
@@ -25,16 +27,15 @@ RETRY_ATTEMPTS = 3
 RETRY_MIN_WAIT = 1
 RETRY_MAX_WAIT = 60
 
-# Prompt asks for structured JSON so we can parse summary, technologies, structure
-SYSTEM_PROMPT = """You are a technical writer. Given repository file contents and structure, produce a short summary in the exact JSON format below. Use only the keys "summary", "technologies", and "structure". No other keys or markdown code fences.
+# Load Jinja2 prompt templates from summary_api.prompts package
+_prompts_dir = files("summary_api.prompts")
+_SYSTEM_TEMPLATE = Template((_prompts_dir / "system.j2").read_text(encoding="utf-8"))
+_USER_TEMPLATE = Template((_prompts_dir / "user.j2").read_text(encoding="utf-8"))
 
-Format:
-{"summary": "1-3 sentences describing what the project does.", "technologies": ["Python", "FastAPI", ...], "structure": "Brief description of directory layout and key folders."}"""
 
-USER_PROMPT_TEMPLATE = """Summarize this repository based on the following context.
-
-{context}
-"""
+def render_user_prompt_preview(placeholder: str = "<context>") -> str:
+    """Render the user prompt with a placeholder for logging/debug (e.g. debug_repo_flow)."""
+    return _USER_TEMPLATE.render(context=placeholder)
 
 
 class LLMClientError(Exception):
@@ -58,8 +59,8 @@ def _is_llm_transient(exc: BaseException) -> bool:
 def _build_messages(context: str) -> list[dict[str, str]]:
     """Build chat messages for OpenAI-compatible (Nebius) completion request."""
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": USER_PROMPT_TEMPLATE.format(context=context)},
+        {"role": "system", "content": _SYSTEM_TEMPLATE.render()},
+        {"role": "user", "content": _USER_TEMPLATE.render(context=context)},
     ]
 
 

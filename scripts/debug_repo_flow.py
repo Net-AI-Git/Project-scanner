@@ -202,10 +202,11 @@ def step4_context(files: list):
     logger.info("-" * 40)
     logger.info("%s", preview)
     logger.info("-" * 40)
-    from summary_api.clients.llm_client import USER_PROMPT_TEMPLATE
+    from summary_api.clients.llm_client import render_user_prompt_preview
+    user_preview = render_user_prompt_preview()
     logger.info("  LLM prompt structure:")
     logger.info("    system: (role + JSON format)")
-    logger.info("    user: %s...", USER_PROMPT_TEMPLATE.strip()[:80])
+    logger.info("    user: %s...", user_preview.strip()[:80])
     logger.info("    Inside user: the context built above (%s chars).", len(context))
     logger.info("")
     return context
