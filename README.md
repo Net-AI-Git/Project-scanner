@@ -9,43 +9,28 @@ This README provides the **step-by-step setup and run instructions**, **model ch
 ## Requirements
 
 - **Python 3.12** (the project was developed and tested with 3.12)
+- **UV** for dependency and run management ([install UV](https://docs.astral.sh/uv/getting-started/installation/) — e.g. `pip install uv` or use the official installer)
 - A Nebius Token Factory API key (see below).
 
 ---
 
 ## Setup and run (step-by-step)
 
-1. **Clone or unpack the project** so that the `summary_api` folder and the project root (with `requirements.txt`) are available.  
-   If Python is not installed, install **Python 3.12** from [python.org](https://www.python.org/downloads/) and tick "Add Python to PATH". On Windows, `py -3.12 -m venv .venv` creates a venv with 3.12 if you have multiple versions.
+1. **Clone or unpack the project** so that the `summary_api` folder and the project root (with `pyproject.toml`) are available.  
+   If Python is not installed, install **Python 3.12** from [python.org](https://www.python.org/downloads/) and tick "Add Python to PATH".
 
-2. **Create a virtual environment** (recommended):
-   - **Windows** (use the Python Launcher; `-3.12` picks Python 3.12 if you have several versions):
-     ```powershell
-     py -3.12 -m venv .venv
-     ```
-   - **macOS/Linux** (use `python3.12` if you have multiple versions):
-     ```bash
-     python3.12 -m venv .venv
-     ```
-
-3. **Activate the virtual environment** (required before installing packages and running the server):
-   - **Windows** (PowerShell or CMD):
-     ```powershell
-     .venv\Scripts\activate
-     ```
-   - **macOS/Linux**:
-     ```bash
-     source .venv/bin/activate
-     ```
-   After activation, the prompt will show `(.venv)` at the end of the line.
-
-4. **Install dependencies** from the project root:
+2. **Install UV** (if not already installed):
    ```bash
-   pip install -r requirements.txt
+   pip install uv
    ```
-   On Windows, if `pip` is not found: `py -m pip install -r requirements.txt`.
 
-5. **Configure environment variables.**  
+3. **Install dependencies** from the project root (UV creates and uses a virtual environment automatically):
+   ```bash
+   uv sync
+   ```
+   This reads `pyproject.toml` and `uv.lock` and installs all dependencies. To regenerate the lock file after changing dependencies, run `uv lock`.
+
+4. **Configure environment variables.**  
    The LLM is configured via the **`NEBIUS_API_KEY`** environment variable (we do not hardcode API keys). Get a key at [Nebius Token Factory](https://tokenfactory.nebius.com/) (API keys: [project/api-keys](https://tokenfactory.nebius.com/project/api-keys)).
 
    **Option A — PowerShell (Windows):** set the key in the current session before running the server. Use quotes around the key:
@@ -73,21 +58,31 @@ This README provides the **step-by-step setup and run instructions**, **model ch
    ```
    Restart the server after changing `.env`.
 
-6. **Run the server** — from the **project root** (see [Run the server](#run-the-server) for the command). After it starts, the `POST /summarize` endpoint is available at `http://localhost:8000/summarize`.
+5. **Run the server** — from the **project root** (see [Run the server](#run-the-server) for the command). After it starts, the `POST /summarize` endpoint is available at `http://localhost:8000/summarize`, and health probes at `GET /health/live` and `GET /health/ready`.
 
 ---
 
 ## Run the server
 
-Start the server on **port 8000**. From the **project root**:
+Run the API with **Uvicorn** only (do not start the server with `python main.py`). From the **project root**:
+
+**Development** (with auto-reload; do not use `--workers` in development):
 
 ```bash
-uvicorn summary_api.main:app --host 0.0.0.0 --port 8000
+uv run uvicorn summary_api.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-If you are already inside `summary_api`, run only: `uvicorn main:app --host 0.0.0.0 --port 8000`
+**Production** (use multiple workers; do not use `--reload` in production):
 
-The `POST /summarize` endpoint will be available at `http://localhost:8000/summarize`.
+```bash
+uv run uvicorn summary_api.main:app --host 0.0.0.0 --port 8000 --workers 4
+```
+
+Adjust the `--workers` value (e.g. 4) per environment and load. After the server starts:
+
+- **POST /summarize** — main endpoint for repo summarization.
+- **GET /health/live** — liveness probe (e.g. for Kubernetes).
+- **GET /health/ready** — readiness probe (cached ~5s).
 
 ---
 
@@ -167,4 +162,4 @@ summary_api/
 └── audit.py         # Audit logging for requests and errors
 ```
 
-Dependencies are in the project root `requirements.txt` (e.g. `fastapi`, `uvicorn`, `pydantic-settings`, `httpx`). Use that file for `pip install -r requirements.txt` as in the setup steps above.
+Dependencies are managed with **UV**: see `pyproject.toml` and `uv.lock` in the project root. Use `uv sync` to install (see setup steps above).

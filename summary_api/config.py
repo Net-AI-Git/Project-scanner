@@ -33,10 +33,30 @@ class Settings(BaseSettings):
 
 
 def get_settings() -> Settings:
-    """Return application settings (env-based)."""
+    """Return application settings loaded from environment and .env file.
+
+    Why: Single source of truth for API keys and config; pydantic-settings handles validation.
+    What: Instantiates Settings with env_file at project root; sensitive fields use SecretStr.
+
+    Returns:
+        Settings instance with NEBIUS_*, GITHUB_TOKEN, etc.
+
+    Raises:
+        ValidationError: If required env vars fail validation (pydantic-settings).
+    """
     return Settings()
 
 
 def get_env_file_path() -> Path:
-    """Return path to .env file used for loading (for logging)."""
+    """Return path to .env file used for loading (for logging and diagnostics).
+
+    Why: Callers can log which env file is in use without hardcoding paths.
+    What: Returns the Path resolved from this module's parent (project root).
+
+    Returns:
+        Path to .env file (may or may not exist).
+
+    Raises:
+        None.
+    """
     return _ENV_FILE

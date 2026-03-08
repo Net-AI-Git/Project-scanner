@@ -24,8 +24,8 @@ def write_to_dlq(
 ) -> None:
     """Append one failed request to the DLQ file (append-only).
 
-    Called when a step fails after all retries so the request can be reviewed
-    or reprocessed later. Does not raise; logs and swallows write errors.
+    Why: Failed requests after all retries must be captured for review/reprocess (error-handling rule).
+    What: Writes one JSON line to DLQ file; catches and ignores any IO or encoding error.
 
     Args:
         correlation_id: Request/session UUID for traceability.
@@ -35,7 +35,10 @@ def write_to_dlq(
         dlq_path: Override path (default from DLQ_PATH env or DEFAULT_DLQ_PATH).
 
     Returns:
-        None. Swallows exceptions so the API response is never broken.
+        None.
+
+    Raises:
+        None. All exceptions are caught and swallowed so the API response is never broken.
     """
     path = dlq_path or os.environ.get("DLQ_PATH", DEFAULT_DLQ_PATH)
     entry = {

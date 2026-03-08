@@ -15,7 +15,20 @@ class SummarizeRequest(BaseModel):
     @field_validator("github_url")
     @classmethod
     def github_url_non_empty(cls, v: str) -> str:
-        """Reject missing or empty github_url so validation returns a clear error."""
+        """Reject missing or empty github_url so validation returns a clear error.
+
+        Why: API contract requires a non-empty string; Pydantic surfaces this as 400.
+        What: Strips whitespace; raises ValueError if missing, not a string, or empty.
+
+        Args:
+            v: Raw value for github_url from request body.
+
+        Returns:
+            Stripped non-empty github_url string.
+
+        Raises:
+            ValueError: If v is missing, not a str, or empty/whitespace-only.
+        """
         if not (v and isinstance(v, str) and v.strip()):
             raise ValueError("github_url is required and must be a non-empty string")
         return v.strip()

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List
 
 import httpx
 from circuitbreaker import circuit
@@ -110,50 +109,79 @@ async def _get_file_content(
         return None
 
 
+def _contents_api_url(owner: str, repo: str, path: str) -> str:
+    """Build GitHub Contents API URL for owner/repo and optional path."""
+    if path:
+        return f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{path}"
+    return f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents"
+
+
+async def _handle_content_item(
+    client: httpx.AsyncClient,
+    owner: str,
+    repo: str,
+    path: str,
+    item: dict,
+    files: list[RepoFile],
+    max_files: int,
+) -> None:
+    """Append one file's content to files or recurse into a directory."""
+    name = item.get("name") or ""
+    item_path = item.get("path") or (f"{path}/{name}".lstrip("/") if path else name)
+    if item.get("type") == "file":
+        content = await _get_file_content(client, item.get("download_url"))
+        if content is not None:
+            files.append(RepoFile(path=item_path, content=content))
+    elif item.get("type") == "dir":
+        await _fetch_contents_recurse(
+            client=client, owner=owner, repo=repo, path=item_path,
+            files=files, max_files=max_files,
+        )
+
+
 async def _fetch_contents_recurse(
     client: httpx.AsyncClient,
     owner: str,
     repo: str,
     path: str,
-    files: List[RepoFile],
+    files: list[RepoFile],
     max_files: int,
 ) -> None:
     """List contents at path; for each file fetch content and append; for each dir recurse."""
     if len(files) >= max_files:
         return
-    url = (
-        f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{path}"
-        if path
-        else f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents"
-    )
+    url = _contents_api_url(owner, repo, path)
     resp = await client.get(url)
     resp.raise_for_status()
     data = resp.json()
     if not isinstance(data, list):
-        item = data
-        if item.get("type") == "file":
-            content = await _get_file_content(client, item.get("download_url"))
-            if content is not None:
-                files.append(RepoFile(path=item.get("path", path), content=content))
+        await _handle_content_item(client, owner, repo, path, data, files, max_files)
         return
     for item in data:
         if len(files) >= max_files:
             return
-        name = item.get("name") or ""
-        item_path = item.get("path") or (f"{path}/{name}".lstrip("/") if path else name)
-        if item.get("type") == "file":
-            content = await _get_file_content(client, item.get("download_url"))
-            if content is not None:
-                files.append(RepoFile(path=item_path, content=content))
-        elif item.get("type") == "dir":
-            await _fetch_contents_recurse(
-                client=client,
-                owner=owner,
-                repo=repo,
-                path=item_path,
-                files=files,
-                max_files=max_files,
-            )
+        await _handle_content_item(client, owner, repo, path, item, files, max_files)
+
+
+def _raise_github_http_error(e: httpx.HTTPStatusError) -> None:
+    """Map httpx.HTTPStatusError to GitHubClientError and raise (transient/permanent)."""
+    if e.response.status_code == 404:
+        raise GitHubClientError(
+            "Repository not found or private", is_transient=False
+        ) from e
+    if e.response.status_code == 403:
+        raise GitHubClientError(
+            "GitHub API rate limit or access denied", is_transient=True
+        ) from e
+    if e.response.status_code >= 500:
+        raise GitHubClientError(
+            f"GitHub API error: {e.response.status_code} {e.response.text[:200]}",
+            is_transient=True,
+        ) from e
+    raise GitHubClientError(
+        f"GitHub API error: {e.response.status_code} {e.response.text[:200]}",
+        is_transient=False,
+    ) from e
 
 
 @circuit(failure_threshold=5, recovery_timeout=60, expected_exception=GitHubClientError)
@@ -169,7 +197,7 @@ async def fetch_repo_files(
     timeout: float = DEFAULT_TIMEOUT,
     max_files: int = DEFAULT_MAX_FILES,
     github_token: str | None = None,
-) -> List[RepoFile]:
+) -> list[RepoFile]:
     """Fetch list of files with content from a public GitHub repository (async).
 
     Uses GitHub Contents API with async httpx. Transient errors (rate limit, timeout,
@@ -193,35 +221,15 @@ async def fetch_repo_files(
     headers: dict[str, str] = {}
     if github_token and github_token.strip():
         headers["Authorization"] = f"Bearer {github_token.strip()}"
-    files: List[RepoFile] = []
+    files: list[RepoFile] = []
     async with httpx.AsyncClient(timeout=timeout, headers=headers or None) as client:
         try:
             await _fetch_contents_recurse(
-                client=client,
-                owner=owner,
-                repo=repo,
-                path="",
-                files=files,
-                max_files=max_files,
+                client=client, owner=owner, repo=repo, path="",
+                files=files, max_files=max_files,
             )
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                raise GitHubClientError(
-                    "Repository not found or private", is_transient=False
-                ) from e
-            if e.response.status_code == 403:
-                raise GitHubClientError(
-                    "GitHub API rate limit or access denied", is_transient=True
-                ) from e
-            if e.response.status_code >= 500:
-                raise GitHubClientError(
-                    f"GitHub API error: {e.response.status_code} {e.response.text[:200]}",
-                    is_transient=True,
-                ) from e
-            raise GitHubClientError(
-                f"GitHub API error: {e.response.status_code} {e.response.text[:200]}",
-                is_transient=False,
-            ) from e
+            _raise_github_http_error(e)
         except httpx.TimeoutException as e:
             raise GitHubClientError("Request to GitHub timed out", is_transient=True) from e
         except httpx.RequestError as e:

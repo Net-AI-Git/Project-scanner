@@ -44,8 +44,23 @@ def log_audit(
 ) -> None:
     """Append one audit entry (JSON line) to AUDIT.jsonl. Append-only, no deletion.
 
-    Required fields per audit-protocol RULE.mdc §1 Audit Log Structure.
-    Hash computed over entry (without log_hash) per §1 Immutable Logs.
+    Why: Audit protocol requires immutable, append-only logs with required fields and hash.
+    What: Builds entry with required fields, computes SHA-256 over payload, appends one JSON line.
+
+    Args:
+        event_type: Event type (e.g. api_request, execution_step).
+        resource: Resource or step name.
+        action: Action (e.g. POST, call).
+        result: success or failure.
+        correlation_id: Request UUID.
+        metadata: Optional extra key-value data (sanitized, no secrets).
+        audit_path: Override path (default from AUDIT_LOG_PATH or DEFAULT_AUDIT_PATH).
+
+    Returns:
+        None.
+
+    Raises:
+        OSError: On failure to open or write to the audit file (e.g. permission, disk full).
     """
     path = audit_path or os.environ.get("AUDIT_LOG_PATH", DEFAULT_AUDIT_PATH)
     entry = {
@@ -67,6 +82,29 @@ def log_audit(
         f.write(line)
 
 
+def _build_audit_step_meta(
+    *,
+    step_index: int | None = None,
+    input_summary: dict[str, Any] | None = None,
+    output_summary: dict[str, Any] | None = None,
+    error_detail: dict[str, Any] | None = None,
+    duration_ms: float | None = None,
+) -> dict[str, Any]:
+    """Build metadata dict for an execution_step audit entry."""
+    meta: dict[str, Any] = {}
+    if step_index is not None:
+        meta["step_index"] = step_index
+    if input_summary is not None:
+        meta["input_summary"] = dict(input_summary)
+    if output_summary is not None:
+        meta["output_summary"] = dict(output_summary)
+    if error_detail is not None:
+        meta["error_detail"] = dict(error_detail)
+    if duration_ms is not None:
+        meta["duration_ms"] = round(duration_ms, 2)
+    return meta
+
+
 def log_audit_step(
     correlation_id: str,
     step_name: str,
@@ -81,9 +119,8 @@ def log_audit_step(
 ) -> None:
     """Log one execution step for full trace (LLM-as-Judge).
 
-    Records what was called, with what inputs, what was returned or what error
-    occurred and where, plus optional duration. All written to the same AUDIT.jsonl
-    so a session can be reconstructed by correlation_id.
+    Why: Judge needs full execution trace per correlation_id to evaluate API behavior.
+    What: Builds metadata from step args, calls log_audit with event_type execution_step.
 
     Args:
         correlation_id: Request/session UUID.
@@ -95,18 +132,20 @@ def log_audit_step(
         error_detail: On failure, e.g. {"message": "...", "where": "module.function", "traceback": "..."}.
         duration_ms: Optional elapsed time in milliseconds.
         audit_path: Override path (default from AUDIT_LOG_PATH or DEFAULT_AUDIT_PATH).
+
+    Returns:
+        None.
+
+    Raises:
+        OSError: On failure to write to audit file (propagated from log_audit).
     """
-    meta: dict[str, Any] = {}
-    if step_index is not None:
-        meta["step_index"] = step_index
-    if input_summary is not None:
-        meta["input_summary"] = dict(input_summary)
-    if output_summary is not None:
-        meta["output_summary"] = dict(output_summary)
-    if error_detail is not None:
-        meta["error_detail"] = dict(error_detail)
-    if duration_ms is not None:
-        meta["duration_ms"] = round(duration_ms, 2)
+    meta = _build_audit_step_meta(
+        step_index=step_index,
+        input_summary=input_summary,
+        output_summary=output_summary,
+        error_detail=error_detail,
+        duration_ms=duration_ms,
+    )
     log_audit(
         event_type="execution_step",
         resource=step_name,
@@ -121,12 +160,18 @@ def log_audit_step(
 def error_detail_from_exception(exc: BaseException, where: str) -> dict[str, Any]:
     """Build error_detail dict for log_audit_step from an exception.
 
+    Why: Structured error logging requires message, location, and traceback for Splunk/Judge.
+    What: Formats exception message and traceback; returns dict with message, where, traceback.
+
     Args:
         exc: The exception that was raised.
         where: Identifier of where it happened (e.g. "summary_api.github_client.fetch_repo_files").
 
     Returns:
-        Dict with message, where, and traceback (string).
+        Dict with keys message (str), where (str), traceback (str).
+
+    Raises:
+        None.
     """
     return {
         "message": str(exc),
@@ -135,40 +180,12 @@ def error_detail_from_exception(exc: BaseException, where: str) -> dict[str, Any
     }
 
 
-def get_session_context_for_judge(
-    correlation_id: str,
-    *,
-    audit_path: str | None = None,
-) -> dict[str, Any]:
-    """Load all audit entries for one request to feed LLM-as-Judge.
-
-    For external / CLI use only (e.g. Judge tool or scripts that read AUDIT.jsonl).
-    Not called from the Summary API itself.
-
-    Returns a Session Context with execution logs (steps in order), final outcome,
-    and optional performance info, matching the input expected by the LLM Judge
-    rule (Execution Logs, Audit Comparison, Final Output).
-
-    Args:
-        correlation_id: The request UUID to filter by.
-        audit_path: Override path (default from AUDIT_LOG_PATH or DEFAULT_AUDIT_PATH).
-
-    Returns:
-        Dict with keys: correlation_id, execution_logs (list of step entries),
-        api_request (final api_request entry if any), session_summary.
-    """
-    path = audit_path or os.environ.get("AUDIT_LOG_PATH", DEFAULT_AUDIT_PATH)
+def _read_audit_entries_by_correlation(
+    path: str, correlation_id: str
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Read audit file and return (execution_logs, api_request) for the given correlation_id."""
     execution_logs: list[dict[str, Any]] = []
     api_request: dict[str, Any] | None = None
-
-    if not os.path.isfile(path):
-        return {
-            "correlation_id": correlation_id,
-            "execution_logs": [],
-            "api_request": None,
-            "session_summary": "No audit file or no entries for this correlation_id.",
-        }
-
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -184,12 +201,54 @@ def get_session_context_for_judge(
                 execution_logs.append(entry)
             elif entry.get("event_type") == "api_request":
                 api_request = entry
+    return execution_logs, api_request
 
-    steps_ordered = sorted(execution_logs, key=lambda e: (e.get("metadata", {}).get("step_index", 999), e.get("timestamp", "")))
-    session_summary = (
-        f"Steps: {len(steps_ordered)}. "
-        f"Final result: {api_request.get('result', 'unknown') if api_request else 'no api_request'}."
+
+def _build_session_summary(
+    steps_ordered: list[dict[str, Any]], api_request: dict[str, Any] | None
+) -> str:
+    """Build a short session summary string for Judge context."""
+    result = api_request.get("result", "unknown") if api_request else "no api_request"
+    return f"Steps: {len(steps_ordered)}. Final result: {result}."
+
+
+def get_session_context_for_judge(
+    correlation_id: str,
+    *,
+    audit_path: str | None = None,
+) -> dict[str, Any]:
+    """Load all audit entries for one request to feed LLM-as-Judge.
+
+    Why: Judge tool needs full session context (steps + api_request) from AUDIT.jsonl.
+    What: Reads audit file, filters by correlation_id, sorts steps, builds session_summary.
+
+    For external / CLI use only (e.g. Judge tool or scripts). Not called from the Summary API.
+
+    Args:
+        correlation_id: The request UUID to filter by.
+        audit_path: Override path (default from AUDIT_LOG_PATH or DEFAULT_AUDIT_PATH).
+
+    Returns:
+        Dict with keys: correlation_id, execution_logs (list of step entries),
+        api_request (final api_request entry if any), session_summary.
+
+    Raises:
+        OSError: On failure to open or read the audit file.
+    """
+    path = audit_path or os.environ.get("AUDIT_LOG_PATH", DEFAULT_AUDIT_PATH)
+    if not os.path.isfile(path):
+        return {
+            "correlation_id": correlation_id,
+            "execution_logs": [],
+            "api_request": None,
+            "session_summary": "No audit file or no entries for this correlation_id.",
+        }
+    execution_logs, api_request = _read_audit_entries_by_correlation(path, correlation_id)
+    steps_ordered = sorted(
+        execution_logs,
+        key=lambda e: (e.get("metadata", {}).get("step_index", 999), e.get("timestamp", "")),
     )
+    session_summary = _build_session_summary(steps_ordered, api_request)
     return {
         "correlation_id": correlation_id,
         "execution_logs": steps_ordered,

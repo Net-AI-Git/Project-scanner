@@ -1,6 +1,7 @@
 """Tests for summary_api.llm_client: API key from caller, parsing, and error handling (mocked HTTP)."""
 
-from unittest.mock import MagicMock, patch
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -18,11 +19,39 @@ from summary_api.llm_client import (
 def test_summarize_repo_missing_api_key_raises() -> None:
     """Empty or missing API key raises LLMClientError (key must come from config, not hardcoded)."""
     with pytest.raises(LLMClientError) as exc_info:
-        summarize_repo("some context", api_key="")
+        asyncio.run(summarize_repo("some context", api_key=""))
     assert "API key" in exc_info.value.message or "NEBIUS_API_KEY" in exc_info.value.message
 
     with pytest.raises(LLMClientError):
-        summarize_repo("context", api_key="   ")
+        asyncio.run(summarize_repo("context", api_key="   "))
+
+
+# --- Success: response parsed to summary, technologies, structure ---
+# Run before 401/429/timeout tests so the circuit breaker is still closed.
+
+
+def test_summarize_repo_success_nebius_returns_three_fields() -> None:
+    """Successful Nebius (OpenAI-shaped) response is parsed into summary, technologies, structure."""
+    body = {
+        "choices": [
+            {
+                "message": {
+                    "content": '{"summary": "HTTP library.", "technologies": ["Python", "urllib3"], "structure": "src/ and tests/."}',
+                },
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    with patch("summary_api.llm_client.httpx.AsyncClient") as mock_async_client:
+        mock_instance = MagicMock()
+        mock_instance.post = AsyncMock(return_value=httpx.Response(200, json=body))
+        mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
+        mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        result = asyncio.run(summarize_repo("repo context", api_key="fake-key"))
+        assert result["summary"] == "HTTP library."
+        assert result["technologies"] == ["Python", "urllib3"]
+        assert result["structure"] == "src/ and tests/."
 
 
 # --- Parsing: structured output ---
@@ -68,73 +97,39 @@ def test_parse_structured_response_partial_dict() -> None:
 
 def test_summarize_repo_401_raises() -> None:
     """401 response raises LLMClientError with auth message."""
-    with patch("summary_api.llm_client.httpx.Client") as mock_client:
-        mock_post = MagicMock()
-        mock_post.return_value = httpx.Response(401, text="Unauthorized")
+    with patch("summary_api.llm_client.httpx.AsyncClient") as mock_async_client:
         mock_instance = MagicMock()
-        mock_instance.post = mock_post
-        mock_client.return_value.__enter__.return_value = mock_instance
-        mock_client.return_value.__exit__.return_value = None
+        mock_instance.post = AsyncMock(return_value=httpx.Response(401, text="Unauthorized"))
+        mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
+        mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
 
         with pytest.raises(LLMClientError) as exc_info:
-            summarize_repo("context", api_key="fake-key")
+            asyncio.run(summarize_repo("context", api_key="fake-key"))
         assert "401" in exc_info.value.message or "auth" in exc_info.value.message.lower()
 
 
 def test_summarize_repo_429_raises() -> None:
     """429 response raises LLMClientError (rate limit)."""
-    with patch("summary_api.llm_client.httpx.Client") as mock_client:
-        mock_post = MagicMock()
-        mock_post.return_value = httpx.Response(429, text="Too Many Requests")
+    with patch("summary_api.llm_client.httpx.AsyncClient") as mock_async_client:
         mock_instance = MagicMock()
-        mock_instance.post = mock_post
-        mock_client.return_value.__enter__.return_value = mock_instance
-        mock_client.return_value.__exit__.return_value = None
+        mock_instance.post = AsyncMock(return_value=httpx.Response(429, text="Too Many Requests"))
+        mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
+        mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
 
         with pytest.raises(LLMClientError) as exc_info:
-            summarize_repo("context", api_key="fake-key")
+            asyncio.run(summarize_repo("context", api_key="fake-key"))
         assert "429" in exc_info.value.message or "rate" in exc_info.value.message.lower()
 
 
 def test_summarize_repo_timeout_raises() -> None:
     """Timeout raises LLMClientError."""
-    with patch("summary_api.llm_client.httpx.Client") as mock_client:
+    with patch("summary_api.llm_client.httpx.AsyncClient") as mock_async_client:
         mock_instance = MagicMock()
-        mock_instance.post.side_effect = httpx.TimeoutException("timed out")
-        mock_client.return_value.__enter__.return_value = mock_instance
-        mock_client.return_value.__exit__.return_value = None
+        mock_instance.post = AsyncMock(side_effect=httpx.TimeoutException("timed out"))
+        mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
+        mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
 
         with pytest.raises(LLMClientError) as exc_info:
-            summarize_repo("context", api_key="fake-key")
+            asyncio.run(summarize_repo("context", api_key="fake-key"))
         assert "timeout" in exc_info.value.message.lower() or "timed" in exc_info.value.message.lower()
-
-
-# --- Success: response parsed to summary, technologies, structure ---
-
-
-def test_summarize_repo_success_nebius_returns_three_fields() -> None:
-    """Successful Nebius (OpenAI-shaped) response is parsed into summary, technologies, structure."""
-    body = {
-        "choices": [
-            {
-                "message": {
-                    "content": '{"summary": "HTTP library.", "technologies": ["Python", "urllib3"], "structure": "src/ and tests/."}',
-                },
-                "finish_reason": "stop",
-            }
-        ],
-    }
-    with patch("summary_api.llm_client.httpx.Client") as mock_client:
-        mock_post = MagicMock()
-        mock_post.return_value = httpx.Response(200, json=body)
-        mock_instance = MagicMock()
-        mock_instance.post = mock_post
-        mock_client.return_value.__enter__.return_value = mock_instance
-        mock_client.return_value.__exit__.return_value = None
-
-        result = summarize_repo("repo context", api_key="fake-key")
-        assert result["summary"] == "HTTP library."
-        assert result["technologies"] == ["Python", "urllib3"]
-        assert result["structure"] == "src/ and tests/."
-
 

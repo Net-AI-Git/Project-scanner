@@ -1,5 +1,6 @@
 """Tests for summary_api.github_client: URL parsing, fetch, and error handling (real API when GITHUB_TOKEN set)."""
 
+import asyncio
 import os
 
 import pytest
@@ -60,8 +61,9 @@ def test_parse_github_url_none_raises() -> None:
 
 def test_fetch_repo_files_invalid_url_raises() -> None:
     """fetch_repo_files with invalid URL raises GitHubClientError."""
+    import asyncio
     with pytest.raises(GitHubClientError) as exc_info:
-        fetch_repo_files("https://gitlab.com/owner/repo")
+        asyncio.run(fetch_repo_files("https://gitlab.com/owner/repo"))
     assert "Invalid GitHub URL" in (exc_info.value.message or str(exc_info.value))
 
 
@@ -79,10 +81,10 @@ def _github_token() -> str | None:
 def test_fetch_repo_files_404_raises() -> None:
     """fetch_repo_files with nonexistent repo raises GitHubClientError (real API)."""
     with pytest.raises(GitHubClientError) as exc_info:
-        fetch_repo_files(
+        asyncio.run(fetch_repo_files(
             "https://github.com/this-org-does-not-exist-xyz/this-repo-either-xyz",
             github_token=_github_token(),
-        )
+        ))
     msg = (exc_info.value.message or str(exc_info.value)).lower()
     assert "not found" in msg or "private" in msg
 
@@ -93,11 +95,11 @@ def test_fetch_repo_files_404_raises() -> None:
 @pytest.mark.skipif(not _github_token(), reason="Set GITHUB_TOKEN to run real GitHub API tests")
 def test_fetch_repo_files_returns_list_of_files() -> None:
     """Fetching Net-AI-Git/Project-scanner returns list of RepoFile with path and content (real API)."""
-    files = fetch_repo_files(
+    files = asyncio.run(fetch_repo_files(
         "https://github.com/Net-AI-Git/Project-scanner",
         max_files=15,
         github_token=_github_token(),
-    )
+    ))
     assert isinstance(files, list)
     assert len(files) > 0
     assert len(files) <= 15
@@ -111,11 +113,11 @@ def test_fetch_repo_files_returns_list_of_files() -> None:
 @pytest.mark.skipif(not _github_token(), reason="Set GITHUB_TOKEN to run real GitHub API tests")
 def test_fetch_repo_files_includes_readme_content() -> None:
     """At least one file has path containing README and non-empty content (real API)."""
-    files = fetch_repo_files(
+    files = asyncio.run(fetch_repo_files(
         "https://github.com/Net-AI-Git/Project-scanner",
         max_files=50,
         github_token=_github_token(),
-    )
+    ))
     readmes = [f for f in files if "README" in f.path.upper()]
     assert len(readmes) >= 1, "Expected at least one README file"
     assert any(len(f.content) > 0 for f in readmes), "README content should be non-empty"

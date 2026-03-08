@@ -66,6 +66,37 @@ def _build_messages(context: str) -> list[dict[str, str]]:
     ]
 
 
+def _extract_json_text(content: str) -> str:
+    """Extract JSON string from content, optionally inside markdown code fence."""
+    text = (content or "").strip()
+    code_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if code_match:
+        return code_match.group(1).strip()
+    return text
+
+
+def _normalize_parsed_llm_data(data: dict[str, Any], fallback_summary: str) -> dict[str, Any]:
+    """Normalize dict from LLM to keys summary, technologies, structure with correct types."""
+    summary = data.get("summary")
+    if summary is None:
+        summary = str(data.get("description", "")) or fallback_summary
+    if not isinstance(summary, str):
+        summary = str(summary)
+
+    technologies = data.get("technologies")
+    if not isinstance(technologies, list):
+        technologies = []
+    technologies = [t for t in technologies if isinstance(t, str)]
+
+    structure = data.get("structure")
+    if structure is None:
+        structure = ""
+    if not isinstance(structure, str):
+        structure = str(structure)
+
+    return {"summary": summary, "technologies": technologies, "structure": structure}
+
+
 def _parse_structured_response(content: str) -> dict[str, Any]:
     """Parse LLM response into dict with summary, technologies, structure.
 
@@ -74,43 +105,73 @@ def _parse_structured_response(content: str) -> dict[str, Any]:
     """
     if not (content or "").strip():
         return {"summary": "", "technologies": [], "structure": ""}
-
-    text = content.strip()
-    code_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    if code_match:
-        text = code_match.group(1).strip()
-
+    text = _extract_json_text(content)
+    fallback = content.strip()
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        return {
-            "summary": content.strip(),
-            "technologies": [],
-            "structure": "",
-        }
-
+        return {"summary": fallback, "technologies": [], "structure": ""}
     if not isinstance(data, dict):
-        return {"summary": content.strip(), "technologies": [], "structure": ""}
+        return {"summary": fallback, "technologies": [], "structure": ""}
+    return _normalize_parsed_llm_data(data, fallback)
 
-    summary = data.get("summary")
-    technologies = data.get("technologies")
-    structure = data.get("structure")
 
-    if summary is None:
-        summary = str(data.get("description", "")) or content.strip()
-    if not isinstance(summary, str):
-        summary = str(summary)
+def _check_llm_response_status(response: httpx.Response) -> None:
+    """Raise LLMClientError for non-2xx status; otherwise return None."""
+    if response.status_code == 401:
+        raise LLMClientError(
+            "LLM API authentication failed (invalid or missing API key).",
+            is_transient=False,
+        )
+    if response.status_code == 429:
+        raise LLMClientError(
+            "LLM API rate limit exceeded. Try again later.", is_transient=True
+        )
+    if response.status_code >= 500:
+        raise LLMClientError(
+            f"LLM API server error: {response.status_code}.", is_transient=True
+        )
+    if response.status_code >= 400:
+        try:
+            body = response.json()
+            msg = (
+                body.get("error", body.get("message", response.text))
+                or f"HTTP {response.status_code}"
+            )
+        except Exception:
+            msg = response.text or f"HTTP {response.status_code}"
+        raise LLMClientError(f"LLM API error: {msg}", is_transient=False)
 
-    if not isinstance(technologies, list):
-        technologies = []
-    technologies = [t for t in technologies if isinstance(t, str)]
 
-    if structure is None:
-        structure = ""
-    if not isinstance(structure, str):
-        structure = str(structure)
-
-    return {"summary": summary, "technologies": technologies, "structure": structure}
+def _extract_llm_content_from_response(response: httpx.Response) -> str:
+    """Parse response JSON and return content string from choices[0].message.content."""
+    try:
+        data = response.json()
+    except Exception as e:
+        raise LLMClientError(
+            f"Invalid LLM API response (not JSON): {e}", is_transient=False
+        ) from e
+    choices = data.get("choices") or []
+    if not choices or not isinstance(choices, list):
+        raise LLMClientError(
+            "Invalid LLM API response: missing or empty choices.", is_transient=False
+        )
+    first = choices[0]
+    if isinstance(first, dict) and first.get("finish_reason") == "length":
+        logger.warning(
+            "LLM response was truncated (finish_reason=length). Consider increasing max_tokens."
+        )
+    message = first.get("message") if isinstance(first, dict) else None
+    if not message or not isinstance(message, dict):
+        raise LLMClientError(
+            "Invalid LLM API response: missing message in choices.", is_transient=False
+        )
+    content = message.get("content")
+    if content is None:
+        content = ""
+    if not isinstance(content, str):
+        content = str(content)
+    return content
 
 
 async def _call_nebius(
@@ -143,58 +204,8 @@ async def _call_nebius(
     }
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(url, json=payload, headers=headers)
-
-    if response.status_code == 401:
-        raise LLMClientError(
-            "LLM API authentication failed (invalid or missing API key).",
-            is_transient=False,
-        )
-    if response.status_code == 429:
-        raise LLMClientError(
-            "LLM API rate limit exceeded. Try again later.", is_transient=True
-        )
-    if response.status_code >= 500:
-        raise LLMClientError(
-            f"LLM API server error: {response.status_code}.", is_transient=True
-        )
-    if response.status_code >= 400:
-        try:
-            body = response.json()
-            msg = (
-                body.get("error", body.get("message", response.text))
-                or f"HTTP {response.status_code}"
-            )
-        except Exception:
-            msg = response.text or f"HTTP {response.status_code}"
-        raise LLMClientError(f"LLM API error: {msg}", is_transient=False)
-
-    try:
-        data = response.json()
-    except Exception as e:
-        raise LLMClientError(
-            f"Invalid LLM API response (not JSON): {e}", is_transient=False
-        ) from e
-    choices = data.get("choices") or []
-    if not choices or not isinstance(choices, list):
-        raise LLMClientError(
-            "Invalid LLM API response: missing or empty choices.", is_transient=False
-        )
-    first = choices[0]
-    finish_reason = first.get("finish_reason") if isinstance(first, dict) else None
-    if finish_reason == "length":
-        logger.warning(
-            "LLM response was truncated (finish_reason=length). Consider increasing max_tokens."
-        )
-    message = first.get("message") if isinstance(first, dict) else None
-    if not message or not isinstance(message, dict):
-        raise LLMClientError(
-            "Invalid LLM API response: missing message in choices.", is_transient=False
-        )
-    content = message.get("content")
-    if content is None:
-        content = ""
-    if not isinstance(content, str):
-        content = str(content)
+    _check_llm_response_status(response)
+    content = _extract_llm_content_from_response(response)
     return _parse_structured_response(content)
 
 

@@ -2,7 +2,7 @@
 """
 Debug Summary API flow — fixed REPO.
 Runs the same flow as POST /summarize on https://github.com/Net-AI-Git/Project-scanner,
-printing each step: what is fetched, what is filtered, which files are sent to the LLM and in what order, and the metrics.
+logging each step: what is fetched, what is filtered, which files are sent to the LLM and in what order, and the metrics.
 
 Run from project root with venv activated:
   python scripts/debug_repo_flow.py         — full flow including LLM call (requires NEBIUS_API_KEY)
@@ -13,8 +13,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
 from pathlib import Path
+
+logger = logging.getLogger("debug_repo_flow")
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setLevel(logging.INFO)
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
 
 # Allow running from project root or from scripts/
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -32,24 +40,24 @@ def step0_params():
     from summary_api.github_client import _parse_github_url, DEFAULT_MAX_FILES
     from summary_api.repo_processor import DEFAULT_MAX_CONTEXT_CHARS
 
-    print("\n" + "=" * 70)
-    print("Step 0: Parameters and settings")
-    print("=" * 70)
-    print(f"  Fixed REPO: {FIXED_REPO_URL}")
+    logger.info("\n" + "=" * 70)
+    logger.info("Step 0: Parameters and settings")
+    logger.info("=" * 70)
+    logger.info("  Fixed REPO: %s", FIXED_REPO_URL)
     try:
         owner, repo = _parse_github_url(FIXED_REPO_URL)
-        print(f"  owner/repo: {owner!r} / {repo!r}")
+        logger.info("  owner/repo: %r / %r", owner, repo)
     except Exception as e:
-        print(f"  URL parse error: {e}")
+        logger.info("  URL parse error: %s", e)
         raise
-    print(f"  max_files (GitHub): {DEFAULT_MAX_FILES}")
-    print(f"  max_context_chars: {DEFAULT_MAX_CONTEXT_CHARS}")
+    logger.info("  max_files (GitHub): %s", DEFAULT_MAX_FILES)
+    logger.info("  max_context_chars: %s", DEFAULT_MAX_CONTEXT_CHARS)
     settings = get_settings()
     has_github = bool((settings.GITHUB_TOKEN.get_secret_value() or "").strip())
     has_nebius = bool((settings.NEBIUS_API_KEY.get_secret_value() or "").strip())
-    print(f"  GITHUB_TOKEN: {'set (5000 req/h)' if has_github else 'not set — 60/h limit'}")
-    print(f"  NEBIUS_API_KEY: {'set' if has_nebius else 'not set'}")
-    print()
+    logger.info("  GITHUB_TOKEN: %s", "set (5000 req/h)" if has_github else "not set — 60/h limit")
+    logger.info("  NEBIUS_API_KEY: %s", "set" if has_nebius else "not set")
+    logger.info("")
 
 
 # ---------------------------------------------------------------------------
@@ -58,26 +66,26 @@ def step0_params():
 def step1_fetch(github_url: str, github_token: str | None):
     from summary_api.github_client import fetch_repo_files, GitHubClientError
 
-    print("\n" + "=" * 70)
-    print("Step 1: Fetch files from GitHub")
-    print("=" * 70)
-    print("  GitHub Contents API: lists directory contents; only files (not dirs as items).")
-    print("  Each file: GET to download_url, UTF-8 content. Binary files are skipped.")
-    print("  Stops after max_files.")
-    print()
+    logger.info("\n" + "=" * 70)
+    logger.info("Step 1: Fetch files from GitHub")
+    logger.info("=" * 70)
+    logger.info("  GitHub Contents API: lists directory contents; only files (not dirs as items).")
+    logger.info("  Each file: GET to download_url, UTF-8 content. Binary files are skipped.")
+    logger.info("  Stops after max_files.")
+    logger.info("")
     try:
         files = asyncio.run(fetch_repo_files(github_url, github_token=github_token))
     except GitHubClientError as e:
-        print(f"  Error: {e.message}")
+        logger.info("  Error: %s", e.message)
         raise
-    print(f"  Files fetched: {len(files)}")
+    logger.info("  Files fetched: %s", len(files))
     paths = [f.path for f in files]
     for i, p in enumerate(sorted(paths)):
-        print(f"    [{i+1}] {p}")
+        logger.info("    [%s] %s", i + 1, p)
     lengths = [len(f.content or "") for f in files]
     if lengths:
-        print(f"\n  Content metrics (chars): min={min(lengths)}, max={max(lengths)}, total={sum(lengths)}")
-    print()
+        logger.info("  Content metrics (chars): min=%s, max=%s, total=%s", min(lengths), max(lengths), sum(lengths))
+    logger.info("")
     return files
 
 
@@ -109,14 +117,14 @@ def _skip_reason(path: str) -> str | None:
 def step2_filter(files: list):
     from summary_api.repo_processor import SKIP_DIRS, SKIP_FILE_PATTERNS, should_skip_path
 
-    print("\n" + "=" * 70)
-    print("Step 2: Filter files (what is skipped)")
-    print("=" * 70)
-    print("  Directories skipped (SKIP_DIRS):")
+    logger.info("\n" + "=" * 70)
+    logger.info("Step 2: Filter files (what is skipped)")
+    logger.info("=" * 70)
+    logger.info("  Directories skipped (SKIP_DIRS):")
     for d in sorted(SKIP_DIRS):
-        print(f"    - {d}")
-    print("  File patterns skipped (SKIP_FILE_PATTERNS): lock, .min.js/.min.css, .map, etc.")
-    print()
+        logger.info("    - %s", d)
+    logger.info("  File patterns skipped (SKIP_FILE_PATTERNS): lock, .min.js/.min.css, .map, etc.")
+    logger.info("")
     skipped = []
     kept = []
     for f in files:
@@ -126,11 +134,11 @@ def step2_filter(files: list):
             skipped.append((path, reason))
         else:
             kept.append(f)
-    print("  Files skipped (path + reason):")
+    logger.info("  Files skipped (path + reason):")
     for path, reason in skipped:
-        print(f"    - {path!r}  => {reason}")
-    print(f"\n  Summary: {len(skipped)} skipped, {len(kept)} kept.")
-    print()
+        logger.info("    - %r  => %s", path, reason)
+    logger.info("  Summary: %s skipped, %s kept.", len(skipped), len(kept))
+    logger.info("")
     return kept
 
 
@@ -140,22 +148,22 @@ def step2_filter(files: list):
 def step3_priorities(files: list):
     from summary_api.repo_processor import _file_priority
 
-    print("\n" + "=" * 70)
-    print("Step 3: Priority order — which files are sent and in what order")
-    print("=" * 70)
-    print("  Priority: lower number = sent first. Sort key: (priority, path).")
-    print("  0 = README/LICENSE/CONTRIBUTING/CHANGELOG (any depth)")
-    print("  1 = config file at root (package.json, requirements.txt, Dockerfile, ...)")
-    print("  2 = config file anywhere")
-    print("  3 = files at depth 0–1")
-    print("  4+ = deeper files")
-    print()
+    logger.info("\n" + "=" * 70)
+    logger.info("Step 3: Priority order — which files are sent and in what order")
+    logger.info("=" * 70)
+    logger.info("  Priority: lower number = sent first. Sort key: (priority, path).")
+    logger.info("  0 = README/LICENSE/CONTRIBUTING/CHANGELOG (any depth)")
+    logger.info("  1 = config file at root (package.json, requirements.txt, Dockerfile, ...)")
+    logger.info("  2 = config file anywhere")
+    logger.info("  3 = files at depth 0–1")
+    logger.info("  4+ = deeper files")
+    logger.info("")
     with_priority = [(f.path, _file_priority(f.path)) for f in files]
     ordered = sorted(with_priority, key=lambda x: (x[1], x[0]))
-    print("  (path, priority) — send order:")
+    logger.info("  (path, priority) — send order:")
     for path, prio in ordered:
-        print(f"    [{prio}] {path}")
-    print()
+        logger.info("    [%s] %s", prio, path)
+    logger.info("")
     return ordered
 
 
@@ -168,32 +176,32 @@ def step4_context(files: list):
         process_repo_files,
     )
 
-    print("\n" + "=" * 70)
-    print("Step 4: Build context (what is sent to the LLM)")
-    print("=" * 70)
-    print(f"  max_context_chars = {DEFAULT_MAX_CONTEXT_CHARS}")
-    print("  Single-file truncation: up to max_chars//3 chars; rest replaced with '[... truncated for context limit ...]'")
-    print("  Directory tree: up to 200 entries (_build_directory_tree)")
-    print("  When space runs out: '(Additional files omitted due to context limit.)' is appended")
-    print()
+    logger.info("\n" + "=" * 70)
+    logger.info("Step 4: Build context (what is sent to the LLM)")
+    logger.info("=" * 70)
+    logger.info("  max_context_chars = %s", DEFAULT_MAX_CONTEXT_CHARS)
+    logger.info("  Single-file truncation: up to max_chars//3 chars; rest replaced with '[... truncated for context limit ...]'")
+    logger.info("  Directory tree: up to 200 entries (_build_directory_tree)")
+    logger.info("  When space runs out: '(Additional files omitted due to context limit.)' is appended")
+    logger.info("")
     context = process_repo_files(files, max_chars=DEFAULT_MAX_CONTEXT_CHARS)
-    print(f"  Final context length: {len(context)} chars")
+    logger.info("  Final context length: %s chars", len(context))
     has_omitted = "(Additional files omitted due to context limit.)" in context
-    print(f"  Files omitted due to context limit: {'yes' if has_omitted else 'no'}")
+    logger.info("  Files omitted due to context limit: %s", "yes" if has_omitted else "no")
     preview_len = 1200
     preview = context[:preview_len]
     if len(context) > preview_len:
         preview += "\n\n[... preview truncated ...]"
-    print(f"\n  Preview (first {min(preview_len, len(context))} chars):")
-    print("-" * 40)
-    print(preview)
-    print("-" * 40)
-    from summary_api.llm_client import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
-    print("\n  LLM prompt structure:")
-    print("    system: (role + JSON format)")
-    print(f"    user: {USER_PROMPT_TEMPLATE.strip()[:80]}...")
-    print(f"    Inside user: the context built above ({len(context)} chars).")
-    print()
+    logger.info("  Preview (first %s chars):", min(preview_len, len(context)))
+    logger.info("-" * 40)
+    logger.info("%s", preview)
+    logger.info("-" * 40)
+    from summary_api.llm_client import USER_PROMPT_TEMPLATE
+    logger.info("  LLM prompt structure:")
+    logger.info("    system: (role + JSON format)")
+    logger.info("    user: %s...", USER_PROMPT_TEMPLATE.strip()[:80])
+    logger.info("    Inside user: the context built above (%s chars).", len(context))
+    logger.info("")
     return context
 
 
@@ -204,16 +212,16 @@ def step5_llm(context: str):
     from summary_api.config import get_settings
     from summary_api.llm_client import summarize_repo, LLMClientError
 
-    print("\n" + "=" * 70)
-    print("Step 5: LLM call (Nebius Token Factory)")
-    print("=" * 70)
+    logger.info("\n" + "=" * 70)
+    logger.info("Step 5: LLM call (Nebius Token Factory)")
+    logger.info("=" * 70)
     settings = get_settings()
     api_key = (settings.NEBIUS_API_KEY.get_secret_value() or "").strip()
     if not api_key:
-        print("  Skipped: NEBIUS_API_KEY not set. Use .env or set the env var.")
+        logger.info("  Skipped: NEBIUS_API_KEY not set. Use .env or set the env var.")
         return
-    print("  Sending context + system/user prompt; waiting for JSON (summary, technologies, structure).")
-    print()
+    logger.info("  Sending context + system/user prompt; waiting for JSON (summary, technologies, structure).")
+    logger.info("")
     try:
         result = asyncio.run(
             summarize_repo(
@@ -224,13 +232,13 @@ def step5_llm(context: str):
                 max_tokens=settings.NEBIUS_MAX_TOKENS,
             )
         )
-        print("  Success.")
-        print(f"  summary: {result.get('summary', '')[:300]}...")
-        print(f"  technologies: {result.get('technologies', [])}")
-        print(f"  structure: {result.get('structure', '')[:300]}...")
+        logger.info("  Success.")
+        logger.info("  summary: %s...", (result.get("summary", "") or "")[:300])
+        logger.info("  technologies: %s", result.get("technologies", []))
+        logger.info("  structure: %s...", (result.get("structure", "") or "")[:300])
     except LLMClientError as e:
-        print(f"  Error: {e.message}")
-    print()
+        logger.info("  Error: %s", e.message)
+    logger.info("")
 
 
 # ---------------------------------------------------------------------------
@@ -246,23 +254,23 @@ def main() -> int:
     settings = get_settings()
     github_token = (settings.GITHUB_TOKEN.get_secret_value() or "").strip() or None
 
-    print("\n*** Debug Summary API flow — fixed REPO:", FIXED_REPO_URL, "***")
+    logger.info("*** Debug Summary API flow — fixed REPO: %s ***", FIXED_REPO_URL)
 
     step0_params()
     files = step1_fetch(FIXED_REPO_URL, github_token)
     if not files:
-        print("No files — exiting.")
+        logger.info("No files — exiting.")
         return 1
     kept = step2_filter(files)
     if not kept:
-        print("No files after filter — exiting.")
+        logger.info("No files after filter — exiting.")
         return 1
     step3_priorities(kept)
     context = step4_context(kept)
     if not args.no_llm:
         step5_llm(context)
     else:
-        print("\n(Skipping step 5 — --no-llm passed)\n")
+        logger.info("(Skipping step 5 — --no-llm passed)")
 
     return 0
 

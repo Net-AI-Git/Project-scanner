@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import re
-from typing import List, Sequence
+from typing import Sequence
 
 from .github_client import RepoFile
 
 # Default context size: ~60k chars leaves room for prompt + response in typical 8k–32k context windows.
+# Note: process_repo_files is currently synchronous. For very large repos (thousands of files),
+# core-python-standards recommends evaluating ProcessPoolExecutor for CPU-bound batch processing.
 DEFAULT_MAX_CONTEXT_CHARS = 60_000
 
 # Directory names we skip (case-insensitive).
@@ -41,13 +43,26 @@ PRIORITY_CONFIG_NAMES = frozenset({
 })
 
 
-def _path_segments(path: str) -> List[str]:
+def _path_segments(path: str) -> list[str]:
     """Return path segments (dirs + final file name)."""
     return [p for p in path.replace("\\", "/").split("/") if p]
 
 
 def should_skip_path(path: str) -> bool:
-    """Return True if this path should be skipped (binary dirs, lock files, etc.)."""
+    """Return True if this path should be skipped (binary dirs, lock files, etc.).
+
+    Why: Reduces noise and size by excluding node_modules, lock files, minified assets.
+    What: Checks path segments against SKIP_DIRS and SKIP_FILE_PATTERNS.
+
+    Args:
+        path: Relative file path (e.g. "src/foo.py" or "node_modules/bar/index.js").
+
+    Returns:
+        True if the path should be excluded from context; False to include.
+
+    Raises:
+        None.
+    """
     segments = _path_segments(path)
     for seg in segments[:-1]:  # directories only
         seg_lower = seg.lower()
@@ -83,12 +98,12 @@ def _file_priority(path: str) -> int:
     return 4 + min(dir_depth, 5)
 
 
-def _build_directory_tree(paths: List[str], max_entries: int = 200) -> str:
+def _build_directory_tree(paths: list[str], max_entries: int = 200) -> str:
     """Build a simple ASCII tree of paths for structure context."""
     if not paths:
         return "(no files)"
     seen: set[str] = set()
-    lines: List[str] = []
+    lines: list[str] = []
     for p in sorted(paths)[:max_entries]:
         parts = p.replace("\\", "/").split("/")
         prefix = ""
@@ -105,39 +120,30 @@ def _build_directory_tree(paths: List[str], max_entries: int = 200) -> str:
     return "\n".join(lines)
 
 
-def process_repo_files(
+def _filter_and_cap_file_list(
     files: Sequence[RepoFile],
-    max_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
-) -> str:
-    """Filter, prioritize, and merge repo files into a single context string for the LLM.
-
-    - Skips: binary dirs (node_modules, __pycache__, .git, venv, ...), lock files, minified files.
-    - Prioritizes: README, LICENSE, config files (package.json, pyproject.toml, ...), then source.
-    - Enforces max_chars by truncating low-priority file contents and then dropping files.
-
-    Returns:
-        Single string: directory tree + key file contents, suitable for LLM context.
-    """
-    filtered: List[RepoFile] = []
+    max_chars: int,
+) -> list[RepoFile]:
+    """Filter out skipped paths and cap single-file content size; return list of RepoFile."""
+    filtered: list[RepoFile] = []
+    cap = max_chars // 3
     for f in files:
         path = f.path or ""
         content = f.content or ""
         if should_skip_path(path):
             continue
-        # Cap single-file size to leave room for other files
-        if len(content) > max_chars // 3:
-            content = content[: max_chars // 3] + "\n\n[... truncated for context limit ...]"
+        if len(content) > cap:
+            content = content[:cap] + "\n\n[... truncated for context limit ...]"
         filtered.append(RepoFile(path=path, content=content))
+    return filtered
 
-    if not filtered:
-        return "Repository has no included text files (all skipped or empty)."
 
+def _build_context_sections(filtered: list[RepoFile], max_chars: int) -> str:
+    """Build directory tree + key file sections string, respecting max_chars."""
     paths = [f.path for f in filtered]
     tree_section = "## Repository structure\n\n```\n" + _build_directory_tree(paths) + "\n```"
-    parts: List[str] = [tree_section, "\n\n## Key files\n"]
+    parts: list[str] = [tree_section, "\n\n## Key files\n"]
     used = len(tree_section) + len("\n\n## Key files\n")
-
-    # Sort by priority, then by path
     ordered = sorted(filtered, key=lambda f: (_file_priority(f.path), f.path))
     omission_msg = "\n\n(Additional files omitted due to context limit.)"
 
@@ -159,3 +165,30 @@ def process_repo_files(
         used += len(header) + len(body)
 
     return "".join(parts)
+
+
+def process_repo_files(
+    files: Sequence[RepoFile],
+    max_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+) -> str:
+    """Filter, prioritize, and merge repo files into a single context string for the LLM.
+
+    Why: LLM needs bounded, relevant context; skip noise and enforce max_chars for context window.
+    What: Filters with should_skip_path, sorts by _file_priority, builds tree + key file sections,
+    truncating per-file and omitting files when limit reached.
+
+    Args:
+        files: List of RepoFile (path, content) from fetch step.
+        max_chars: Maximum total context length (default DEFAULT_MAX_CONTEXT_CHARS).
+
+    Returns:
+        Single string: directory tree + key file contents, suitable for LLM context.
+        If no files pass filter, returns a short message string.
+
+    Raises:
+        None.
+    """
+    filtered = _filter_and_cap_file_list(files, max_chars)
+    if not filtered:
+        return "Repository has no included text files (all skipped or empty)."
+    return _build_context_sections(filtered, max_chars)

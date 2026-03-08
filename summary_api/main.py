@@ -102,6 +102,9 @@ def validation_exception_handler(_request: object, exc: RequestValidationError) 
 
     Returns:
         JSONResponse with status 400 and ErrorResponse body.
+
+    Raises:
+        None.
     """
     errors = exc.errors() or []
     if errors:
@@ -131,6 +134,9 @@ def _github_error_to_status_and_message(exc: GitHubClientError) -> tuple[int, st
 
     Returns:
         (status_code, message) for the error response.
+
+    Raises:
+        None.
     """
     msg = exc.message or str(exc)
     if "Invalid GitHub URL" in msg:
@@ -155,6 +161,9 @@ def _llm_error_to_status_and_message(exc: LLMClientError) -> tuple[int, str]:
 
     Returns:
         (status_code, message) for the error response.
+
+    Raises:
+        None.
     """
     msg = exc.message or str(exc)
     if "authentication" in msg.lower() or "API key" in msg or "401" in msg:
@@ -179,6 +188,9 @@ def _get_llm_provider_and_key(settings: object) -> tuple[str, str]:
 
     Returns:
         (provider_name, api_key_string).
+
+    Raises:
+        None.
     """
     raw = getattr(settings, "NEBIUS_API_KEY", None)
     if hasattr(raw, "get_secret_value"):
@@ -209,6 +221,9 @@ def _audit(
 
     Returns:
         None.
+
+    Raises:
+        None. All exceptions from log_audit are caught and swallowed.
     """
     try:
         meta = {"github_url": request_github_url, "status_code": status_code}
@@ -241,6 +256,9 @@ def _with_correlation_header(
 
     Returns:
         JSONResponse with header set.
+
+    Raises:
+        None.
     """
     return JSONResponse(
         status_code=status,
@@ -250,12 +268,99 @@ def _with_correlation_header(
 
 
 def _error_detail_with_classification(exc: BaseException, where: str) -> dict:
-    """Build error_detail dict with error_classification (transient/permanent) for audit."""
+    """Build error_detail dict with error_classification (transient/permanent) for audit.
+
+    Why: Error-handling rule requires classifying errors for retry vs no-retry and audit.
+    What: Uses error_detail_from_exception then adds error_classification from exc.is_transient.
+
+    Args:
+        exc: The exception that was raised (may have is_transient attribute).
+        where: Identifier of where it happened (e.g. module.function).
+
+    Returns:
+        Dict with message, where, traceback, and error_classification (transient or permanent).
+
+    Raises:
+        None.
+    """
     detail = error_detail_from_exception(exc, where)
     detail["error_classification"] = (
         "transient" if getattr(exc, "is_transient", False) else "permanent"
     )
     return detail
+
+
+def _fetch_step_empty_response(
+    correlation_id: str,
+    req_summary: dict,
+    duration_ms: float,
+) -> tuple[None, JSONResponse]:
+    """Build (None, error_response) for empty repo; log audit step."""
+    log_audit_step(
+        correlation_id, "fetch_repo_files", "failure",
+        step_index=1, input_summary=req_summary,
+        output_summary={"file_count": 0},
+        error_detail={
+            "message": "Repository is empty or has no readable files",
+            "where": "summary_api.main._run_fetch_step",
+            "error_classification": "permanent",
+        },
+        duration_ms=duration_ms,
+    )
+    err_resp = _with_correlation_header(
+        ErrorResponse(status="error", message="Repository is empty or has no readable files").model_dump(),
+        404, correlation_id,
+    )
+    return None, err_resp
+
+
+def _fetch_step_github_error(
+    correlation_id: str,
+    req_summary: dict,
+    e: GitHubClientError,
+    duration_ms: float,
+) -> tuple[None, JSONResponse]:
+    """Log, DLQ, and return error response for GitHubClientError in fetch step."""
+    err_detail = _error_detail_with_classification(e, "summary_api.github_client.fetch_repo_files")
+    log_audit_step(
+        correlation_id, "fetch_repo_files", "failure",
+        step_index=1, input_summary=req_summary,
+        error_detail=err_detail,
+        duration_ms=duration_ms,
+    )
+    write_to_dlq(correlation_id, "fetch_repo_files", request_summary=req_summary, error_detail=err_detail)
+    status, message = _github_error_to_status_and_message(e)
+    return None, _with_correlation_header(
+        ErrorResponse(status="error", message=message).model_dump(), status, correlation_id
+    )
+
+
+def _fetch_step_circuit_error(
+    correlation_id: str,
+    req_summary: dict,
+    e: CircuitBreakerError,
+    duration_ms: float,
+) -> tuple[None, JSONResponse]:
+    """Log, DLQ, and return 503 for CircuitBreakerError in fetch step."""
+    log_audit_step(
+        correlation_id, "fetch_repo_files", "failure",
+        step_index=1, input_summary=req_summary,
+        error_detail={
+            "message": "Service temporarily unavailable (circuit open)",
+            "where": "summary_api.github_client.fetch_repo_files",
+            "error_classification": "transient",
+        },
+        duration_ms=duration_ms,
+    )
+    write_to_dlq(
+        correlation_id, "fetch_repo_files",
+        request_summary=req_summary,
+        error_detail={"message": str(e), "error_classification": "transient"},
+    )
+    return None, _with_correlation_header(
+        ErrorResponse(status="error", message="Service temporarily unavailable. Try again later.").model_dump(),
+        503, correlation_id,
+    )
 
 
 async def _run_fetch_step(
@@ -282,17 +387,7 @@ async def _run_fetch_step(
         files = await fetch_repo_files(github_url, github_token=github_token)
         duration_ms = (time.perf_counter() - t0) * 1000
         if not files:
-            log_audit_step(
-                correlation_id, "fetch_repo_files", "failure",
-                step_index=1, input_summary=req_summary,
-                output_summary={"file_count": 0},
-                error_detail={"message": "Repository is empty or has no readable files", "where": "summary_api.main._run_fetch_step", "error_classification": "permanent"},
-                duration_ms=duration_ms,
-            )
-            return None, _with_correlation_header(
-                ErrorResponse(status="error", message="Repository is empty or has no readable files").model_dump(),
-                404, correlation_id,
-            )
+            return _fetch_step_empty_response(correlation_id, req_summary, duration_ms)
         log_audit_step(
             correlation_id, "fetch_repo_files", "success",
             step_index=1, input_summary=req_summary,
@@ -301,38 +396,29 @@ async def _run_fetch_step(
         return files, None
     except GitHubClientError as e:
         duration_ms = (time.perf_counter() - t0) * 1000
-        log_audit_step(
-            correlation_id, "fetch_repo_files", "failure",
-            step_index=1, input_summary=req_summary,
-            error_detail=_error_detail_with_classification(e, "summary_api.github_client.fetch_repo_files"),
-            duration_ms=duration_ms,
-        )
-        write_to_dlq(
-            correlation_id, "fetch_repo_files",
-            request_summary=req_summary,
-            error_detail=_error_detail_with_classification(e, "summary_api.github_client.fetch_repo_files"),
-        )
-        status, message = _github_error_to_status_and_message(e)
-        return None, _with_correlation_header(
-            ErrorResponse(status="error", message=message).model_dump(), status, correlation_id
-        )
+        return _fetch_step_github_error(correlation_id, req_summary, e, duration_ms)
     except CircuitBreakerError as e:
         duration_ms = (time.perf_counter() - t0) * 1000
-        log_audit_step(
-            correlation_id, "fetch_repo_files", "failure",
-            step_index=1, input_summary=req_summary,
-            error_detail={"message": "Service temporarily unavailable (circuit open)", "where": "summary_api.github_client.fetch_repo_files", "error_classification": "transient"},
-            duration_ms=duration_ms,
-        )
-        write_to_dlq(
-            correlation_id, "fetch_repo_files",
-            request_summary=req_summary,
-            error_detail={"message": str(e), "error_classification": "transient"},
-        )
-        return None, _with_correlation_header(
-            ErrorResponse(status="error", message="Service temporarily unavailable. Try again later.").model_dump(),
-            503, correlation_id,
-        )
+        return _fetch_step_circuit_error(correlation_id, req_summary, e, duration_ms)
+
+
+def _process_step_failure(
+    correlation_id: str,
+    file_count: int,
+    e: Exception,
+    duration_ms: float,
+) -> tuple[None, JSONResponse]:
+    """Log audit failure and return (None, error_response) for process step."""
+    err_detail = {**error_detail_from_exception(e, "summary_api.repo_processor.process_repo_files"), "error_classification": "permanent"}
+    log_audit_step(
+        correlation_id, "process_repo_files", "failure",
+        step_index=2, input_summary={"file_count": file_count},
+        error_detail=err_detail,
+        duration_ms=duration_ms,
+    )
+    return None, _with_correlation_header(
+        ErrorResponse(status="error", message=str(e)).model_dump(), 500, correlation_id
+    )
 
 
 def _run_process_step(
@@ -363,15 +449,82 @@ def _run_process_step(
         return context, None
     except Exception as e:
         duration_ms = (time.perf_counter() - t0) * 1000
-        log_audit_step(
-            correlation_id, "process_repo_files", "failure",
-            step_index=2, input_summary={"file_count": len(files)},
-            error_detail={**error_detail_from_exception(e, "summary_api.repo_processor.process_repo_files"), "error_classification": "permanent"},
-            duration_ms=duration_ms,
-        )
-        return None, _with_correlation_header(
-            ErrorResponse(status="error", message=str(e)).model_dump(), 500, correlation_id
-        )
+        return _process_step_failure(correlation_id, len(files), e, duration_ms)
+
+
+def _llm_step_success(
+    correlation_id: str,
+    input_summary: dict,
+    result: dict,
+    duration_ms: float,
+) -> tuple[dict, None]:
+    """Log success and return (result, None) for LLM step."""
+    log_audit_step(
+        correlation_id, "summarize_repo", "success",
+        step_index=3, input_summary=input_summary,
+        output_summary={
+            "summary_length": len(result.get("summary", "") or ""),
+            "technologies_count": len(result.get("technologies") or []),
+            "structure_length": len(result.get("structure", "") or ""),
+        },
+        duration_ms=duration_ms,
+    )
+    return result, None
+
+
+def _llm_step_llm_error(
+    correlation_id: str,
+    input_summary: dict,
+    context_len: int,
+    provider: str,
+    e: LLMClientError,
+    duration_ms: float,
+) -> tuple[None, JSONResponse]:
+    """Log, DLQ, and return error response for LLMClientError in LLM step."""
+    err_detail = _error_detail_with_classification(e, "summary_api.llm_client.summarize_repo")
+    log_audit_step(
+        correlation_id, "summarize_repo", "failure",
+        step_index=3, input_summary=input_summary,
+        error_detail=err_detail,
+        duration_ms=duration_ms,
+    )
+    write_to_dlq(
+        correlation_id, "summarize_repo",
+        request_summary={"context_length": context_len, "provider": provider},
+        error_detail=err_detail,
+    )
+    status, message = _llm_error_to_status_and_message(e)
+    return None, _with_correlation_header(
+        ErrorResponse(status="error", message=message).model_dump(), status, correlation_id
+    )
+
+
+def _llm_step_circuit_error(
+    correlation_id: str,
+    input_summary: dict,
+    e: CircuitBreakerError,
+    duration_ms: float,
+) -> tuple[None, JSONResponse]:
+    """Log, DLQ, and return 503 for CircuitBreakerError in LLM step."""
+    log_audit_step(
+        correlation_id, "summarize_repo", "failure",
+        step_index=3, input_summary=input_summary,
+        error_detail={
+            "message": "Service temporarily unavailable (circuit open)",
+            "where": "summary_api.llm_client.summarize_repo",
+            "error_classification": "transient",
+        },
+        duration_ms=duration_ms,
+    )
+    write_to_dlq(
+        correlation_id, "summarize_repo",
+        request_summary=input_summary,
+        error_detail={"message": str(e), "error_classification": "transient"},
+    )
+    return None, _with_correlation_header(
+        ErrorResponse(status="error", message="Service temporarily unavailable. Try again later.").model_dump(),
+        503, correlation_id,
+    )
 
 
 async def _run_llm_step(
@@ -404,52 +557,90 @@ async def _run_llm_step(
             max_tokens=getattr(settings, "NEBIUS_MAX_TOKENS", 4096),
         )
         duration_ms = (time.perf_counter() - t0) * 1000
-        log_audit_step(
-            correlation_id, "summarize_repo", "success",
-            step_index=3, input_summary=input_summary,
-            output_summary={
-                "summary_length": len(result.get("summary", "") or ""),
-                "technologies_count": len(result.get("technologies") or []),
-                "structure_length": len(result.get("structure", "") or ""),
-            },
-            duration_ms=duration_ms,
-        )
-        return result, None
+        return _llm_step_success(correlation_id, input_summary, result, duration_ms)
     except LLMClientError as e:
         duration_ms = (time.perf_counter() - t0) * 1000
-        err_detail = _error_detail_with_classification(e, "summary_api.llm_client.summarize_repo")
-        log_audit_step(
-            correlation_id, "summarize_repo", "failure",
-            step_index=3, input_summary=input_summary,
-            error_detail=err_detail,
-            duration_ms=duration_ms,
-        )
-        write_to_dlq(
-            correlation_id, "summarize_repo",
-            request_summary={"context_length": len(context), "provider": provider},
-            error_detail=err_detail,
-        )
-        status, message = _llm_error_to_status_and_message(e)
-        return None, _with_correlation_header(
-            ErrorResponse(status="error", message=message).model_dump(), status, correlation_id
+        return _llm_step_llm_error(
+            correlation_id, input_summary, len(context), provider, e, duration_ms
         )
     except CircuitBreakerError as e:
         duration_ms = (time.perf_counter() - t0) * 1000
-        log_audit_step(
-            correlation_id, "summarize_repo", "failure",
-            step_index=3, input_summary=input_summary,
-            error_detail={"message": "Service temporarily unavailable (circuit open)", "where": "summary_api.llm_client.summarize_repo", "error_classification": "transient"},
-            duration_ms=duration_ms,
+        return _llm_step_circuit_error(correlation_id, input_summary, e, duration_ms)
+
+
+def _build_success_response(result: dict, correlation_id: str) -> Response:
+    """Build 200 Response with SummarizeResponse body and X-Correlation-ID header.
+
+    Why: Centralizes success response construction so summarize() stays under 20 lines.
+    What: Logs lengths, builds SummarizeResponse, JSON-encodes, returns Response with header.
+    """
+    summary_str = result.get("summary", "") or ""
+    structure_str = result.get("structure", "") or ""
+    logger.info(
+        "Response lengths: summary=%d chars, structure=%d chars",
+        len(summary_str),
+        len(structure_str),
+        extra={"correlation_id": correlation_id, "operation_name": "summarize"},
+    )
+    body = SummarizeResponse(
+        summary=summary_str,
+        technologies=result.get("technologies") or [],
+        structure=structure_str,
+    )
+    body_bytes = json.dumps(
+        body.model_dump(),
+        indent=2,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return Response(
+        content=body_bytes,
+        media_type="application/json",
+        status_code=200,
+        headers={"X-Correlation-ID": correlation_id},
+    )
+
+
+# Health endpoints (R1/R2: liveness and readiness for K8s and monitoring)
+HEALTH_READY_CACHE_SEC = 5.0
+_ready_cache: tuple[float, bool] = (0.0, True)
+
+
+def _check_ready() -> bool:
+    """True if app is ready to serve (e.g. settings loaded). Used with ~5s cache per R2."""
+    try:
+        get_settings()
+        return True
+    except Exception:
+        return False
+
+
+@app.get("/health/live", summary="Liveness probe")
+def health_live() -> dict[str, str]:
+    """Liveness: process is alive. No external checks. For Kubernetes liveness probe."""
+    return {"status": "ok"}
+
+
+@app.get("/health/ready", summary="Readiness probe", response_model=None)
+def health_ready() -> dict | JSONResponse:
+    """Readiness: app ready to accept traffic. Cached ~5s per monitoring-and-observability rule."""
+    global _ready_cache
+    now = time.monotonic()
+    cached_at, cached_ok = _ready_cache
+    if now - cached_at < HEALTH_READY_CACHE_SEC:
+        if cached_ok:
+            return {"status": "ok"}
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "message": "Service not ready"},
         )
-        write_to_dlq(
-            correlation_id, "summarize_repo",
-            request_summary=input_summary,
-            error_detail={"message": str(e), "error_classification": "transient"},
-        )
-        return None, _with_correlation_header(
-            ErrorResponse(status="error", message="Service temporarily unavailable. Try again later.").model_dump(),
-            503, correlation_id,
-        )
+    ok = _check_ready()
+    _ready_cache = (now, ok)
+    if ok:
+        return {"status": "ok"}
+    return JSONResponse(
+        status_code=503,
+        content={"status": "not_ready", "message": "Service not ready"},
+    )
 
 
 @app.get("/")
@@ -490,27 +681,4 @@ async def summarize(
         return err
 
     _audit(request.github_url, correlation_id, "success", 200)
-    summary_str = result.get("summary", "") or ""
-    structure_str = result.get("structure", "") or ""
-    logger.info(
-        "Response lengths: summary=%d chars, structure=%d chars",
-        len(summary_str),
-        len(structure_str),
-        extra={"correlation_id": correlation_id, "operation_name": "summarize"},
-    )
-    body = SummarizeResponse(
-        summary=summary_str,
-        technologies=result.get("technologies") or [],
-        structure=structure_str,
-    )
-    body_bytes = json.dumps(
-        body.model_dump(),
-        indent=2,
-        ensure_ascii=False,
-    ).encode("utf-8")
-    return Response(
-        content=body_bytes,
-        media_type="application/json",
-        status_code=200,
-        headers={"X-Correlation-ID": correlation_id},
-    )
+    return _build_success_response(result, correlation_id)

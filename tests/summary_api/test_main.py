@@ -39,6 +39,23 @@ def test_root_returns_json_with_message_and_docs() -> None:
     assert data["docs"] == "/docs", f"Expected docs '/docs', got {data.get('docs')!r}"
 
 
+# --- GET /health/live, /health/ready ---
+
+
+def test_health_live_returns_200_and_ok() -> None:
+    """GET /health/live returns 200 and status ok (liveness probe)."""
+    response = client.get("/health/live")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_health_ready_returns_200_when_ready() -> None:
+    """GET /health/ready returns 200 and status ok when app is ready (readiness probe)."""
+    response = client.get("/health/ready")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
 # --- POST /summarize ---
 
 
