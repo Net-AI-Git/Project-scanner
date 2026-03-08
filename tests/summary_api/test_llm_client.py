@@ -19,11 +19,25 @@ from summary_api.clients.llm_client import (
 def test_summarize_repo_missing_api_key_raises() -> None:
     """Empty or missing API key raises LLMClientError (key must come from config, not hardcoded)."""
     with pytest.raises(LLMClientError) as exc_info:
-        asyncio.run(summarize_repo("some context", api_key=""))
+        asyncio.run(
+            summarize_repo(
+                "some context",
+                api_key="",
+                base_url="https://api.example.com/v1",
+                model="test-model",
+            )
+        )
     assert "API key" in exc_info.value.message or "NEBIUS_API_KEY" in exc_info.value.message
 
     with pytest.raises(LLMClientError):
-        asyncio.run(summarize_repo("context", api_key="   "))
+        asyncio.run(
+            summarize_repo(
+                "context",
+                api_key="   ",
+                base_url="https://api.example.com/v1",
+                model="test-model",
+            )
+        )
 
 
 # --- Success: response parsed to summary, technologies, structure ---
@@ -48,7 +62,14 @@ def test_summarize_repo_success_nebius_returns_three_fields() -> None:
         mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
         mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
 
-        result = asyncio.run(summarize_repo("repo context", api_key="fake-key"))
+        result = asyncio.run(
+            summarize_repo(
+                "repo context",
+                api_key="fake-key",
+                base_url="https://api.example.com/v1",
+                model="test-model",
+            )
+        )
         assert result["summary"] == "HTTP library."
         assert result["technologies"] == ["Python", "urllib3"]
         assert result["structure"] == "src/ and tests/."
@@ -104,7 +125,14 @@ def test_summarize_repo_401_raises() -> None:
         mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
 
         with pytest.raises(LLMClientError) as exc_info:
-            asyncio.run(summarize_repo("context", api_key="fake-key"))
+            asyncio.run(
+                summarize_repo(
+                    "context",
+                    api_key="fake-key",
+                    base_url="https://api.example.com/v1",
+                    model="test-model",
+                )
+            )
         assert "401" in exc_info.value.message or "auth" in exc_info.value.message.lower()
 
 
@@ -117,7 +145,14 @@ def test_summarize_repo_429_raises() -> None:
         mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
 
         with pytest.raises(LLMClientError) as exc_info:
-            asyncio.run(summarize_repo("context", api_key="fake-key"))
+            asyncio.run(
+                summarize_repo(
+                    "context",
+                    api_key="fake-key",
+                    base_url="https://api.example.com/v1",
+                    model="test-model",
+                )
+            )
         assert "429" in exc_info.value.message or "rate" in exc_info.value.message.lower()
 
 
@@ -130,6 +165,13 @@ def test_summarize_repo_timeout_raises() -> None:
         mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
 
         with pytest.raises(LLMClientError) as exc_info:
-            asyncio.run(summarize_repo("context", api_key="fake-key"))
+            asyncio.run(
+                summarize_repo(
+                    "context",
+                    api_key="fake-key",
+                    base_url="https://api.example.com/v1",
+                    model="test-model",
+                )
+            )
         assert "timeout" in exc_info.value.message.lower() or "timed" in exc_info.value.message.lower()
 

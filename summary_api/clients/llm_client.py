@@ -18,10 +18,7 @@ from tenacity import (
 
 logger = logging.getLogger(__name__)
 
-# Nebius Token Factory (OpenAI-compatible). See https://tokenfactory.nebius.com/
-NEBIUS_BASE_URL = "https://api.tokenfactory.nebius.com/v1"
-NEBIUS_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
-
+# base_url and model must be passed from Settings (get_settings().NEBIUS_BASE_URL, NEBIUS_MODEL); no hardcoding here.
 DEFAULT_TIMEOUT = 120.0
 DEFAULT_MAX_TOKENS = 4096
 RETRY_ATTEMPTS = 3
@@ -225,8 +222,8 @@ async def summarize_repo(
     context: str,
     *,
     api_key: str,
-    base_url: str | None = None,
-    model: str | None = None,
+    base_url: str,
+    model: str,
     timeout: float = DEFAULT_TIMEOUT,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     client: httpx.AsyncClient | None = None,
@@ -242,8 +239,8 @@ async def summarize_repo(
     Args:
         context: Prepared repo context string (from repo_processor).
         api_key: API key from config (NEBIUS_API_KEY), never hardcoded.
-        base_url: Override API base URL (default NEBIUS_BASE_URL).
-        model: Override model ID (default NEBIUS_MODEL).
+        base_url: API base URL; caller must pass from Settings.NEBIUS_BASE_URL.
+        model: Model ID; caller must pass from Settings.NEBIUS_MODEL.
         timeout: Request timeout in seconds.
         max_tokens: Max tokens to generate.
         client: Optional shared AsyncClient for connection pooling.
@@ -260,11 +257,6 @@ async def summarize_repo(
             "LLM API key is not configured. Set NEBIUS_API_KEY in the environment.",
             is_transient=False,
         )
-
-    if base_url is None:
-        base_url = NEBIUS_BASE_URL
-    if model is None:
-        model = NEBIUS_MODEL
 
     try:
         return await _call_nebius(

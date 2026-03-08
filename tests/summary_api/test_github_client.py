@@ -63,7 +63,7 @@ def test_fetch_repo_files_invalid_url_raises() -> None:
     """fetch_repo_files with invalid URL raises GitHubClientError."""
     import asyncio
     with pytest.raises(GitHubClientError) as exc_info:
-        asyncio.run(fetch_repo_files("https://gitlab.com/owner/repo"))
+        asyncio.run(fetch_repo_files("https://gitlab.com/owner/repo", github_api_base="https://api.github.com"))
     assert "Invalid GitHub URL" in (exc_info.value.message or str(exc_info.value))
 
 
@@ -83,6 +83,7 @@ def test_fetch_repo_files_404_raises() -> None:
     with pytest.raises(GitHubClientError) as exc_info:
         asyncio.run(fetch_repo_files(
             "https://github.com/this-org-does-not-exist-xyz/this-repo-either-xyz",
+            github_api_base="https://api.github.com",
             github_token=_github_token(),
         ))
     msg = (exc_info.value.message or str(exc_info.value)).lower()
@@ -97,6 +98,7 @@ def test_fetch_repo_files_returns_list_of_files() -> None:
     """Fetching Net-AI-Git/Project-scanner returns list of RepoFile with path and content (real API)."""
     files = asyncio.run(fetch_repo_files(
         "https://github.com/Net-AI-Git/Project-scanner",
+        github_api_base="https://api.github.com",
         max_files=15,
         github_token=_github_token(),
     ))
@@ -115,6 +117,7 @@ def test_fetch_repo_files_includes_readme_content() -> None:
     """At least one file has path containing README and non-empty content (real API)."""
     files = asyncio.run(fetch_repo_files(
         "https://github.com/Net-AI-Git/Project-scanner",
+        github_api_base="https://api.github.com",
         max_files=50,
         github_token=_github_token(),
     ))

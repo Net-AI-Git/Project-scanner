@@ -21,12 +21,6 @@ import traceback
 from datetime import datetime, timezone
 from typing import Any
 
-# Default: project root, or set AUDIT_LOG_PATH in env
-DEFAULT_AUDIT_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "AUDIT.jsonl",
-)
-
 
 def _timestamp_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -40,7 +34,7 @@ def log_audit(
     correlation_id: str,
     metadata: dict[str, Any] | None = None,
     *,
-    audit_path: str | None = None,
+    audit_path: str,
 ) -> None:
     """Append one audit entry (JSON line) to AUDIT.jsonl. Append-only, no deletion.
 
@@ -54,7 +48,7 @@ def log_audit(
         result: success or failure.
         correlation_id: Request UUID.
         metadata: Optional extra key-value data (sanitized, no secrets).
-        audit_path: Override path (default from AUDIT_LOG_PATH or DEFAULT_AUDIT_PATH).
+        audit_path: Path to audit log file. Caller must pass from Settings.AUDIT_LOG_PATH (get_settings().AUDIT_LOG_PATH).
 
     Returns:
         None.
@@ -62,7 +56,7 @@ def log_audit(
     Raises:
         OSError: On failure to open or write to the audit file (e.g. permission, disk full).
     """
-    path = audit_path or os.environ.get("AUDIT_LOG_PATH", DEFAULT_AUDIT_PATH)
+    path = audit_path
     entry = {
         "timestamp": _timestamp_utc(),
         "event_type": event_type,
@@ -123,7 +117,7 @@ def log_audit_step(
     duration_ms: float | None = None,
     start_timestamp: str | None = None,
     end_timestamp: str | None = None,
-    audit_path: str | None = None,
+    audit_path: str,
 ) -> None:
     """Log one execution step for full trace (LLM-as-Judge).
 
@@ -141,7 +135,7 @@ def log_audit_step(
         duration_ms: Optional elapsed time in milliseconds.
         start_timestamp: Optional ISO 8601 UTC start time (R2 observability).
         end_timestamp: Optional ISO 8601 UTC end time (R2 observability).
-        audit_path: Override path (default from AUDIT_LOG_PATH or DEFAULT_AUDIT_PATH).
+        audit_path: Path to audit log file. Caller must pass from Settings.AUDIT_LOG_PATH (get_settings().AUDIT_LOG_PATH).
 
     Returns:
         None.
@@ -227,7 +221,7 @@ def _build_session_summary(
 def get_session_context_for_judge(
     correlation_id: str,
     *,
-    audit_path: str | None = None,
+    audit_path: str,
 ) -> dict[str, Any]:
     """Load all audit entries for one request to feed LLM-as-Judge.
 
@@ -235,10 +229,11 @@ def get_session_context_for_judge(
     What: Reads audit file, filters by correlation_id, sorts steps, builds session_summary.
 
     For external / CLI use only (e.g. Judge tool or scripts). Not called from the Summary API.
+    Caller must pass audit_path from Settings.AUDIT_LOG_PATH (get_settings().AUDIT_LOG_PATH).
 
     Args:
         correlation_id: The request UUID to filter by.
-        audit_path: Override path (default from AUDIT_LOG_PATH or DEFAULT_AUDIT_PATH).
+        audit_path: Path to audit log file (from Settings.AUDIT_LOG_PATH).
 
     Returns:
         Dict with keys: correlation_id, execution_logs (list of step entries),
@@ -247,7 +242,7 @@ def get_session_context_for_judge(
     Raises:
         OSError: On failure to open or read the audit file.
     """
-    path = audit_path or os.environ.get("AUDIT_LOG_PATH", DEFAULT_AUDIT_PATH)
+    path = audit_path
     if not os.path.isfile(path):
         return {
             "correlation_id": correlation_id,

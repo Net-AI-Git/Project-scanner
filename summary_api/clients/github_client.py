@@ -23,8 +23,7 @@ RETRY_ATTEMPTS = 3
 RETRY_MIN_WAIT = 1
 RETRY_MAX_WAIT = 60
 
-# GitHub API base (no auth required for public repos)
-GITHUB_API_BASE = "https://api.github.com"
+# GitHub API base must be passed from Settings (get_settings().GITHUB_API_BASE); no hardcoding here.
 
 
 @dataclass
@@ -113,11 +112,12 @@ async def _get_file_content(
         return None
 
 
-def _contents_api_url(owner: str, repo: str, path: str) -> str:
+def _contents_api_url(owner: str, repo: str, path: str, api_base: str) -> str:
     """Build GitHub Contents API URL for owner/repo and optional path."""
+    base = api_base.rstrip("/")
     if path:
-        return f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{path}"
-    return f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents"
+        return f"{base}/repos/{owner}/{repo}/contents/{path}"
+    return f"{base}/repos/{owner}/{repo}/contents"
 
 
 async def _handle_content_item(
@@ -129,6 +129,7 @@ async def _handle_content_item(
     files: list[RepoFile],
     max_files: int,
     *,
+    api_base: str,
     headers: dict[str, str] | None = None,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> None:
@@ -144,7 +145,8 @@ async def _handle_content_item(
     elif item.get("type") == "dir":
         await _fetch_contents_recurse(
             client=client, owner=owner, repo=repo, path=item_path,
-            files=files, max_files=max_files, headers=headers, timeout=timeout,
+            files=files, max_files=max_files, api_base=api_base,
+            headers=headers, timeout=timeout,
         )
 
 
@@ -156,20 +158,21 @@ async def _fetch_contents_recurse(
     files: list[RepoFile],
     max_files: int,
     *,
+    api_base: str,
     headers: dict[str, str] | None = None,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> None:
     """List contents at path; for each file fetch content and append; for each dir recurse."""
     if len(files) >= max_files:
         return
-    url = _contents_api_url(owner, repo, path)
+    url = _contents_api_url(owner, repo, path, api_base)
     resp = await client.get(url, headers=headers, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
     if not isinstance(data, list):
         await _handle_content_item(
             client, owner, repo, path, data, files, max_files,
-            headers=headers, timeout=timeout,
+            api_base=api_base, headers=headers, timeout=timeout,
         )
         return
     for item in data:
@@ -177,7 +180,7 @@ async def _fetch_contents_recurse(
             return
         await _handle_content_item(
             client, owner, repo, path, item, files, max_files,
-            headers=headers, timeout=timeout,
+            api_base=api_base, headers=headers, timeout=timeout,
         )
 
 
@@ -212,6 +215,7 @@ def _raise_github_http_error(e: httpx.HTTPStatusError) -> None:
 async def fetch_repo_files(
     github_url: str,
     *,
+    github_api_base: str,
     timeout: float = DEFAULT_TIMEOUT,
     max_files: int = DEFAULT_MAX_FILES,
     github_token: str | None = None,
@@ -228,6 +232,7 @@ async def fetch_repo_files(
 
     Args:
         github_url: Full URL of the repo, e.g. https://github.com/owner/repo
+        github_api_base: GitHub API base URL; caller must pass from Settings.GITHUB_API_BASE.
         timeout: Request timeout in seconds.
         max_files: Maximum number of files to fetch.
         github_token: Optional GitHub token for higher rate limit (5000/h).
@@ -245,12 +250,13 @@ async def fetch_repo_files(
     if github_token and github_token.strip():
         headers["Authorization"] = f"Bearer {github_token.strip()}"
     files: list[RepoFile] = []
+    api_base = github_api_base.rstrip("/")
 
     async def _do_fetch(c: httpx.AsyncClient) -> None:
         await _fetch_contents_recurse(
             client=c, owner=owner, repo=repo, path="",
-            files=files, max_files=max_files, headers=headers or None,
-            timeout=timeout,
+            files=files, max_files=max_files, api_base=api_base,
+            headers=headers or None, timeout=timeout,
         )
 
     if client is not None:

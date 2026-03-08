@@ -63,7 +63,7 @@ def step0_params():
 # ---------------------------------------------------------------------------
 # Step 1: Fetch files from GitHub
 # ---------------------------------------------------------------------------
-def step1_fetch(github_url: str, github_token: str | None):
+def step1_fetch(github_url: str, github_token: str | None, github_api_base: str):
     from summary_api.clients.github_client import fetch_repo_files, GitHubClientError
 
     logger.info("\n" + "=" * 70)
@@ -74,7 +74,13 @@ def step1_fetch(github_url: str, github_token: str | None):
     logger.info("  Stops after max_files.")
     logger.info("")
     try:
-        files = asyncio.run(fetch_repo_files(github_url, github_token=github_token))
+        files = asyncio.run(
+            fetch_repo_files(
+                github_url,
+                github_api_base=github_api_base,
+                github_token=github_token,
+            )
+        )
     except GitHubClientError as e:
         logger.info("  Error: %s", e.message)
         raise
@@ -257,7 +263,7 @@ def main() -> int:
     logger.info("*** Debug Summary API flow — fixed REPO: %s ***", FIXED_REPO_URL)
 
     step0_params()
-    files = step1_fetch(FIXED_REPO_URL, github_token)
+    files = step1_fetch(FIXED_REPO_URL, github_token, settings.GITHUB_API_BASE)
     if not files:
         logger.info("No files — exiting.")
         return 1
