@@ -2,8 +2,8 @@
 
 import pytest
 
-from summary_api.github_client import RepoFile
-from summary_api.repo_processor import (
+from summary_api.clients.github_client import RepoFile
+from summary_api.services.repo_processor import (
     DEFAULT_MAX_CONTEXT_CHARS,
     process_repo_files,
     should_skip_path,

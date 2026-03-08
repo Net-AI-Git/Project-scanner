@@ -181,6 +181,8 @@ async def _call_nebius(
     model: str,
     timeout: float,
     max_tokens: int,
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
     """Call Nebius Token Factory (OpenAI-compatible) chat/completions API (async)."""
     messages = _build_messages(context)
@@ -202,8 +204,11 @@ async def _call_nebius(
         "temperature": 0.3,
         "response_format": {"type": "json_object"},
     }
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(url, json=payload, headers=headers)
+    if client is not None:
+        response = await client.post(url, json=payload, headers=headers, timeout=timeout)
+    else:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            response = await c.post(url, json=payload, headers=headers)
     _check_llm_response_status(response)
     content = _extract_llm_content_from_response(response)
     return _parse_structured_response(content)
@@ -224,11 +229,15 @@ async def summarize_repo(
     model: str | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     max_tokens: int = DEFAULT_MAX_TOKENS,
+    client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
     """Call the LLM API to summarize repository context (async, with retry and circuit breaker).
 
     Transient errors (429, 5xx, timeout, network) are retried with exponential backoff
     and jitter. Circuit breaker opens after 5 failures, 60s recovery timeout.
+
+    When client is provided (e.g. app.state.http_client), uses it for connection
+    pooling (R4); otherwise creates a new AsyncClient per call.
 
     Args:
         context: Prepared repo context string (from repo_processor).
@@ -237,6 +246,7 @@ async def summarize_repo(
         model: Override model ID (default NEBIUS_MODEL).
         timeout: Request timeout in seconds.
         max_tokens: Max tokens to generate.
+        client: Optional shared AsyncClient for connection pooling.
 
     Returns:
         Dict with keys: summary (str), technologies (list[str]), structure (str).
@@ -258,7 +268,7 @@ async def summarize_repo(
 
     try:
         return await _call_nebius(
-            context, api_key, base_url, model, timeout, max_tokens
+            context, api_key, base_url, model, timeout, max_tokens, client=client
         )
     except httpx.TimeoutException as e:
         raise LLMClientError(

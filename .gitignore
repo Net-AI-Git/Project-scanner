@@ -1,30 +1,44 @@
-# Cursor IDE
+# --- IDE / Editor ---
 .cursor/
 
-# Environment (API keys — never commit)
+# --- Environment & secrets (never commit) ---
 .env
 .env.local
 .env.*.local
 
-# Python
+# --- Python ---
 __pycache__/
 *.py[cod]
 *.pyo
-.pytest_cache/
-pytest-cache-files-*
-tests/
+*.so
+.Python
+.mypy_cache/
+.ruff_cache/
 
-# Virtual environment
+# --- Virtual environments ---
 .venv/
 venv/
 env/
 
+# --- Build & distribution ---
+*.egg-info/
+*.egg
+dist/
+build/
+eggs/
+
+# --- Testing & coverage ---
+.pytest_cache/
+pytest-cache-files-*
+.coverage
+.coverage.*
+htmlcov/
+
+# --- Project-specific ---
 # Audit log (append-only; may contain request URLs/messages)
 AUDIT.jsonl
-
 # Explore / local scripts (not part of main app)
 explore_github_api/
-
 # Task documents (local / draft)
 TASK_BREAKDOWN.md
 TASK_AI_PERFORMANCE_ENGINEERING_2026.md

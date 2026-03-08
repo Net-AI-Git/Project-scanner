@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-from summary_api.github_client import (
+from summary_api.clients.github_client import (
     GitHubClientError,
     RepoFile,
     _parse_github_url,

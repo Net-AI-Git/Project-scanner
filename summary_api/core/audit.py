@@ -89,6 +89,8 @@ def _build_audit_step_meta(
     output_summary: dict[str, Any] | None = None,
     error_detail: dict[str, Any] | None = None,
     duration_ms: float | None = None,
+    start_timestamp: str | None = None,
+    end_timestamp: str | None = None,
 ) -> dict[str, Any]:
     """Build metadata dict for an execution_step audit entry."""
     meta: dict[str, Any] = {}
@@ -102,6 +104,10 @@ def _build_audit_step_meta(
         meta["error_detail"] = dict(error_detail)
     if duration_ms is not None:
         meta["duration_ms"] = round(duration_ms, 2)
+    if start_timestamp is not None:
+        meta["start_timestamp"] = start_timestamp
+    if end_timestamp is not None:
+        meta["end_timestamp"] = end_timestamp
     return meta
 
 
@@ -115,6 +121,8 @@ def log_audit_step(
     output_summary: dict[str, Any] | None = None,
     error_detail: dict[str, Any] | None = None,
     duration_ms: float | None = None,
+    start_timestamp: str | None = None,
+    end_timestamp: str | None = None,
     audit_path: str | None = None,
 ) -> None:
     """Log one execution step for full trace (LLM-as-Judge).
@@ -131,6 +139,8 @@ def log_audit_step(
         output_summary: On success, summary of return (e.g. {"file_count": 42}); None on failure.
         error_detail: On failure, e.g. {"message": "...", "where": "module.function", "traceback": "..."}.
         duration_ms: Optional elapsed time in milliseconds.
+        start_timestamp: Optional ISO 8601 UTC start time (R2 observability).
+        end_timestamp: Optional ISO 8601 UTC end time (R2 observability).
         audit_path: Override path (default from AUDIT_LOG_PATH or DEFAULT_AUDIT_PATH).
 
     Returns:
@@ -145,6 +155,8 @@ def log_audit_step(
         output_summary=output_summary,
         error_detail=error_detail,
         duration_ms=duration_ms,
+        start_timestamp=start_timestamp,
+        end_timestamp=end_timestamp,
     )
     log_audit(
         event_type="execution_step",
@@ -165,7 +177,7 @@ def error_detail_from_exception(exc: BaseException, where: str) -> dict[str, Any
 
     Args:
         exc: The exception that was raised.
-        where: Identifier of where it happened (e.g. "summary_api.github_client.fetch_repo_files").
+        where: Identifier of where it happened (e.g. "summary_api.clients.github_client.fetch_repo_files").
 
     Returns:
         Dict with keys message (str), where (str), traceback (str).

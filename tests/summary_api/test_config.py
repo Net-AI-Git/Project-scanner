@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from summary_api.config import Settings, get_settings
+from summary_api.core.config import Settings, get_settings
 
 
 def test_get_settings_returns_settings_instance() -> None:

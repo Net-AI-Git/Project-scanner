@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Sequence
 
-from .github_client import RepoFile
+from summary_api.clients.github_client import RepoFile
 
 # Default context size: ~60k chars leaves room for prompt + response in typical 8k–32k context windows.
 # Note: process_repo_files is currently synchronous. For very large repos (thousands of files),

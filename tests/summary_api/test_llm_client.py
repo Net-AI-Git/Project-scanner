@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from summary_api.llm_client import (
+from summary_api.clients.llm_client import (
     LLMClientError,
     _parse_structured_response,
     summarize_repo,
@@ -42,7 +42,7 @@ def test_summarize_repo_success_nebius_returns_three_fields() -> None:
             }
         ],
     }
-    with patch("summary_api.llm_client.httpx.AsyncClient") as mock_async_client:
+    with patch("summary_api.clients.llm_client.httpx.AsyncClient") as mock_async_client:
         mock_instance = MagicMock()
         mock_instance.post = AsyncMock(return_value=httpx.Response(200, json=body))
         mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
@@ -97,7 +97,7 @@ def test_parse_structured_response_partial_dict() -> None:
 
 def test_summarize_repo_401_raises() -> None:
     """401 response raises LLMClientError with auth message."""
-    with patch("summary_api.llm_client.httpx.AsyncClient") as mock_async_client:
+    with patch("summary_api.clients.llm_client.httpx.AsyncClient") as mock_async_client:
         mock_instance = MagicMock()
         mock_instance.post = AsyncMock(return_value=httpx.Response(401, text="Unauthorized"))
         mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
@@ -110,7 +110,7 @@ def test_summarize_repo_401_raises() -> None:
 
 def test_summarize_repo_429_raises() -> None:
     """429 response raises LLMClientError (rate limit)."""
-    with patch("summary_api.llm_client.httpx.AsyncClient") as mock_async_client:
+    with patch("summary_api.clients.llm_client.httpx.AsyncClient") as mock_async_client:
         mock_instance = MagicMock()
         mock_instance.post = AsyncMock(return_value=httpx.Response(429, text="Too Many Requests"))
         mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
@@ -123,7 +123,7 @@ def test_summarize_repo_429_raises() -> None:
 
 def test_summarize_repo_timeout_raises() -> None:
     """Timeout raises LLMClientError."""
-    with patch("summary_api.llm_client.httpx.AsyncClient") as mock_async_client:
+    with patch("summary_api.clients.llm_client.httpx.AsyncClient") as mock_async_client:
         mock_instance = MagicMock()
         mock_instance.post = AsyncMock(side_effect=httpx.TimeoutException("timed out"))
         mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_instance)

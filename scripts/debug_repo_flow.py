@@ -36,9 +36,9 @@ FIXED_REPO_URL = "https://github.com/Net-AI-Git/Project-scanner"
 # Step 0: Parameters and settings
 # ---------------------------------------------------------------------------
 def step0_params():
-    from summary_api.config import get_settings
-    from summary_api.github_client import _parse_github_url, DEFAULT_MAX_FILES
-    from summary_api.repo_processor import DEFAULT_MAX_CONTEXT_CHARS
+    from summary_api.core.config import get_settings
+    from summary_api.clients.github_client import _parse_github_url, DEFAULT_MAX_FILES
+    from summary_api.services.repo_processor import DEFAULT_MAX_CONTEXT_CHARS
 
     logger.info("\n" + "=" * 70)
     logger.info("Step 0: Parameters and settings")
@@ -64,7 +64,7 @@ def step0_params():
 # Step 1: Fetch files from GitHub
 # ---------------------------------------------------------------------------
 def step1_fetch(github_url: str, github_token: str | None):
-    from summary_api.github_client import fetch_repo_files, GitHubClientError
+    from summary_api.clients.github_client import fetch_repo_files, GitHubClientError
 
     logger.info("\n" + "=" * 70)
     logger.info("Step 1: Fetch files from GitHub")
@@ -98,7 +98,7 @@ def _path_segments(path: str) -> list[str]:
 
 def _skip_reason(path: str) -> str | None:
     """Return skip reason if path is skipped, else None."""
-    from summary_api.repo_processor import SKIP_DIRS, SKIP_FILE_PATTERNS
+    from summary_api.services.repo_processor import SKIP_DIRS, SKIP_FILE_PATTERNS
 
     segments = _path_segments(path)
     for seg in segments[:-1]:
@@ -115,7 +115,7 @@ def _skip_reason(path: str) -> str | None:
 
 
 def step2_filter(files: list):
-    from summary_api.repo_processor import SKIP_DIRS, SKIP_FILE_PATTERNS, should_skip_path
+    from summary_api.services.repo_processor import SKIP_DIRS, SKIP_FILE_PATTERNS, should_skip_path
 
     logger.info("\n" + "=" * 70)
     logger.info("Step 2: Filter files (what is skipped)")
@@ -146,7 +146,7 @@ def step2_filter(files: list):
 # Step 3: Priority order
 # ---------------------------------------------------------------------------
 def step3_priorities(files: list):
-    from summary_api.repo_processor import _file_priority
+    from summary_api.services.repo_processor import _file_priority
 
     logger.info("\n" + "=" * 70)
     logger.info("Step 3: Priority order — which files are sent and in what order")
@@ -171,7 +171,7 @@ def step3_priorities(files: list):
 # Step 4: Build context
 # ---------------------------------------------------------------------------
 def step4_context(files: list):
-    from summary_api.repo_processor import (
+    from summary_api.services.repo_processor import (
         DEFAULT_MAX_CONTEXT_CHARS,
         process_repo_files,
     )
@@ -196,7 +196,7 @@ def step4_context(files: list):
     logger.info("-" * 40)
     logger.info("%s", preview)
     logger.info("-" * 40)
-    from summary_api.llm_client import USER_PROMPT_TEMPLATE
+    from summary_api.clients.llm_client import USER_PROMPT_TEMPLATE
     logger.info("  LLM prompt structure:")
     logger.info("    system: (role + JSON format)")
     logger.info("    user: %s...", USER_PROMPT_TEMPLATE.strip()[:80])
@@ -209,8 +209,8 @@ def step4_context(files: list):
 # Step 5: LLM call (optional)
 # ---------------------------------------------------------------------------
 def step5_llm(context: str):
-    from summary_api.config import get_settings
-    from summary_api.llm_client import summarize_repo, LLMClientError
+    from summary_api.core.config import get_settings
+    from summary_api.clients.llm_client import summarize_repo, LLMClientError
 
     logger.info("\n" + "=" * 70)
     logger.info("Step 5: LLM call (Nebius Token Factory)")
@@ -249,7 +249,7 @@ def main() -> int:
     parser.add_argument("--no-llm", action="store_true", help="Do not call the LLM; stop after building context")
     args = parser.parse_args()
 
-    from summary_api.config import get_settings
+    from summary_api.core.config import get_settings
 
     settings = get_settings()
     github_token = (settings.GITHUB_TOKEN.get_secret_value() or "").strip() or None

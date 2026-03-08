@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from summary_api.schemas import ErrorResponse, SummarizeRequest, SummarizeResponse
+from summary_api.models.schemas import ErrorResponse, SummarizeRequest, SummarizeResponse
 
 
 # --- SummarizeRequest ---

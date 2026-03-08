@@ -64,7 +64,7 @@ This README provides the **step-by-step setup and run instructions**, **model ch
 
 ## Run the server
 
-Run the API with **Uvicorn** only (do not start the server with `python main.py`). From the **project root**:
+Run the API with **Uvicorn** only. Do **not** run the server with `python main.py` or `python -m summary_api.main`; use the uvicorn commands below. From the **project root**:
 
 **Development** (with auto-reload; do not use `--workers` in development):
 
@@ -146,6 +146,13 @@ On error, the API returns an appropriate HTTP status (e.g. 400, 404, 502) and a 
 ```
 
 Examples: invalid or non-GitHub URL (400), repo not found or private (404), LLM or network failure (502).
+
+---
+
+## Infrastructure and observability
+
+- **Logging:** Logs are emitted as JSON to stdout when `LOG_FORMAT=json`; audit and DLQ write to `AUDIT.jsonl` and `DLQ.jsonl` for local or external collection. **Splunk HEC ingestion is currently out of scope**; add a HEC sink in your log pipeline if you use Splunk.
+- **Tenancy:** The service is **single-tenant**. For multi-tenant deployments, apply `tenant_id` and isolation per the multi-tenancy rule.
 
 ---
 

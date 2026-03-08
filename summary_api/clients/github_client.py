@@ -85,13 +85,17 @@ def _parse_github_url(github_url: str) -> tuple[str, str]:
 
 
 async def _get_file_content(
-    client: httpx.AsyncClient, download_url: str | None
+    client: httpx.AsyncClient,
+    download_url: str | None,
+    *,
+    headers: dict[str, str] | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
 ) -> str | None:
     """Fetch raw file content from download_url. Returns None if binary or error."""
     if not download_url:
         return None
     try:
-        resp = await client.get(download_url)
+        resp = await client.get(download_url, headers=headers, timeout=timeout)
         resp.raise_for_status()
         content_type = resp.headers.get("content-type", "")
         if "charset" in content_type or "text" in content_type or not content_type:
@@ -124,18 +128,23 @@ async def _handle_content_item(
     item: dict,
     files: list[RepoFile],
     max_files: int,
+    *,
+    headers: dict[str, str] | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
 ) -> None:
     """Append one file's content to files or recurse into a directory."""
     name = item.get("name") or ""
     item_path = item.get("path") or (f"{path}/{name}".lstrip("/") if path else name)
     if item.get("type") == "file":
-        content = await _get_file_content(client, item.get("download_url"))
+        content = await _get_file_content(
+            client, item.get("download_url"), headers=headers, timeout=timeout
+        )
         if content is not None:
             files.append(RepoFile(path=item_path, content=content))
     elif item.get("type") == "dir":
         await _fetch_contents_recurse(
             client=client, owner=owner, repo=repo, path=item_path,
-            files=files, max_files=max_files,
+            files=files, max_files=max_files, headers=headers, timeout=timeout,
         )
 
 
@@ -146,21 +155,30 @@ async def _fetch_contents_recurse(
     path: str,
     files: list[RepoFile],
     max_files: int,
+    *,
+    headers: dict[str, str] | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
 ) -> None:
     """List contents at path; for each file fetch content and append; for each dir recurse."""
     if len(files) >= max_files:
         return
     url = _contents_api_url(owner, repo, path)
-    resp = await client.get(url)
+    resp = await client.get(url, headers=headers, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
     if not isinstance(data, list):
-        await _handle_content_item(client, owner, repo, path, data, files, max_files)
+        await _handle_content_item(
+            client, owner, repo, path, data, files, max_files,
+            headers=headers, timeout=timeout,
+        )
         return
     for item in data:
         if len(files) >= max_files:
             return
-        await _handle_content_item(client, owner, repo, path, item, files, max_files)
+        await _handle_content_item(
+            client, owner, repo, path, item, files, max_files,
+            headers=headers, timeout=timeout,
+        )
 
 
 def _raise_github_http_error(e: httpx.HTTPStatusError) -> None:
@@ -197,6 +215,7 @@ async def fetch_repo_files(
     timeout: float = DEFAULT_TIMEOUT,
     max_files: int = DEFAULT_MAX_FILES,
     github_token: str | None = None,
+    client: httpx.AsyncClient | None = None,
 ) -> list[RepoFile]:
     """Fetch list of files with content from a public GitHub repository (async).
 
@@ -204,11 +223,15 @@ async def fetch_repo_files(
     network) are retried with exponential backoff and jitter. Circuit breaker opens
     after 5 failures and blocks for 60s before half-open.
 
+    When client is provided (e.g. app.state.http_client), uses it for connection
+    pooling (R4); otherwise creates a new AsyncClient per call.
+
     Args:
         github_url: Full URL of the repo, e.g. https://github.com/owner/repo
         timeout: Request timeout in seconds.
         max_files: Maximum number of files to fetch.
         github_token: Optional GitHub token for higher rate limit (5000/h).
+        client: Optional shared AsyncClient for connection pooling.
 
     Returns:
         List of RepoFile (path, content). Paths are relative to repo root.
@@ -222,12 +245,28 @@ async def fetch_repo_files(
     if github_token and github_token.strip():
         headers["Authorization"] = f"Bearer {github_token.strip()}"
     files: list[RepoFile] = []
-    async with httpx.AsyncClient(timeout=timeout, headers=headers or None) as client:
+
+    async def _do_fetch(c: httpx.AsyncClient) -> None:
+        await _fetch_contents_recurse(
+            client=c, owner=owner, repo=repo, path="",
+            files=files, max_files=max_files, headers=headers or None,
+            timeout=timeout,
+        )
+
+    if client is not None:
         try:
-            await _fetch_contents_recurse(
-                client=client, owner=owner, repo=repo, path="",
-                files=files, max_files=max_files,
-            )
+            await _do_fetch(client)
+        except httpx.HTTPStatusError as e:
+            _raise_github_http_error(e)
+        except httpx.TimeoutException as e:
+            raise GitHubClientError("Request to GitHub timed out", is_transient=True) from e
+        except httpx.RequestError as e:
+            raise GitHubClientError(f"Network error: {e!s}", is_transient=True) from e
+        return files
+
+    async with httpx.AsyncClient(timeout=timeout, headers=headers or None) as c:
+        try:
+            await _do_fetch(c)
         except httpx.HTTPStatusError as e:
             _raise_github_http_error(e)
         except httpx.TimeoutException as e:
