@@ -1,13 +1,14 @@
-"""FastAPI application: POST /summarize — full flow: GitHub → repo_processor → LLM → response."""
+"""FastAPI application: POST /summarize and POST /scan (security scan)."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -16,18 +17,15 @@ from fastapi.responses import JSONResponse, Response
 
 logging.getLogger("summary_api.clients.llm_client").setLevel(logging.INFO)
 
-try:
-    from circuitbreaker import CircuitBreakerError  # type: ignore[import-untyped]
-except ImportError:
-    CircuitBreakerError = Exception  # noqa: A001
-
-from summary_api.clients.github_client import GitHubClientError, RepoFile, fetch_repo_files
-from summary_api.clients.llm_client import LLMClientError, summarize_repo
-from summary_api.core.audit import error_detail_from_exception, log_audit, log_audit_step
+from summary_api.core.audit import log_audit
 from summary_api.core.config import get_env_file_path, get_settings
-from summary_api.infrastructure.dlq import write_to_dlq
-from summary_api.models.schemas import ErrorResponse, SummarizeRequest, SummarizeResponse
-from summary_api.services.repo_processor import process_repo_files
+from summary_api.models.schemas import (
+    ErrorResponse,
+    ScanRequest,
+    SummarizeRequest,
+    SummarizeResponse,
+)
+from summary_api.workflows import get_scan_graph, get_summarize_graph
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
@@ -121,83 +119,6 @@ def validation_exception_handler(_request: object, exc: RequestValidationError) 
     )
 
 
-def _github_error_to_status_and_message(exc: GitHubClientError) -> tuple[int, str]:
-    """Map GitHubClientError to HTTP status code and user-facing message.
-
-    Why: Callers need a single (status, message) to return to the client.
-    What: Classifies by message content; 400 invalid URL, 404 not found, 503 rate limit, else 502.
-
-    Args:
-        exc: The GitHub client exception.
-
-    Returns:
-        (status_code, message) for the error response.
-
-    Raises:
-        None.
-    """
-    msg = exc.message or str(exc)
-    if "Invalid GitHub URL" in msg:
-        return 400, msg
-    if "not found" in msg.lower() or "private" in msg.lower():
-        return 404, msg
-    if "timed out" in msg.lower() or "Network error" in msg:
-        return 502, msg
-    if "rate limit" in msg.lower() or "403" in msg:
-        return 503, msg
-    return 502, msg
-
-
-def _llm_error_to_status_and_message(exc: LLMClientError) -> tuple[int, str]:
-    """Map LLMClientError to HTTP status code and user-facing message.
-
-    Why: Callers need a single (status, message) to return to the client.
-    What: 401 auth, 429 rate limit, 502 timeout/server/network.
-
-    Args:
-        exc: The LLM client exception.
-
-    Returns:
-        (status_code, message) for the error response.
-
-    Raises:
-        None.
-    """
-    msg = exc.message or str(exc)
-    if "authentication" in msg.lower() or "API key" in msg or "401" in msg:
-        return 401, msg
-    if "rate limit" in msg.lower() or "429" in msg:
-        return 429, msg
-    if "timed out" in msg.lower() or "network" in msg.lower():
-        return 502, msg
-    if "server error" in msg.lower() or "500" in msg:
-        return 502, msg
-    return 502, msg
-
-
-def _get_llm_provider_and_key(settings: object) -> tuple[str, str]:
-    """Return Nebius as provider and NEBIUS_API_KEY (or empty string if not set).
-
-    Why: Centralizes secret access so callers never log the key.
-    What: Reads SecretStr from settings; returns provider name and raw key for the client.
-
-    Args:
-        settings: Application Settings instance from get_settings().
-
-    Returns:
-        (provider_name, api_key_string).
-
-    Raises:
-        None.
-    """
-    raw = getattr(settings, "NEBIUS_API_KEY", None)
-    if hasattr(raw, "get_secret_value"):
-        nebius_key = (raw.get_secret_value() or "").strip()
-    else:
-        nebius_key = (raw or "").strip() if isinstance(raw, str) else ""
-    return "nebius", nebius_key
-
-
 def _audit(
     request_github_url: str,
     correlation_id: str,
@@ -241,455 +162,6 @@ def _audit(
         )
     except Exception:
         pass
-
-
-def _with_correlation_header(
-    content: dict, status: int, correlation_id: str
-) -> JSONResponse:
-    """Build JSONResponse with X-Correlation-ID for LLM-as-Judge trace lookup.
-
-    Why: Clients and Judge scripts need the correlation ID in the response.
-    What: Wraps JSONResponse with X-Correlation-ID header.
-
-    Args:
-        content: Response body dict.
-        status: HTTP status code.
-        correlation_id: Request UUID.
-
-    Returns:
-        JSONResponse with header set.
-
-    Raises:
-        None.
-    """
-    return JSONResponse(
-        status_code=status,
-        content=content,
-        headers={"X-Correlation-ID": correlation_id},
-    )
-
-
-def _error_detail_with_classification(exc: BaseException, where: str) -> dict:
-    """Build error_detail dict with error_classification (transient/permanent) for audit.
-
-    Why: Error-handling rule requires classifying errors for retry vs no-retry and audit.
-    What: Uses error_detail_from_exception then adds error_classification from exc.is_transient.
-
-    Args:
-        exc: The exception that was raised (may have is_transient attribute).
-        where: Identifier of where it happened (e.g. module.function).
-
-    Returns:
-        Dict with message, where, traceback, and error_classification (transient or permanent).
-
-    Raises:
-        None.
-    """
-    detail = error_detail_from_exception(exc, where)
-    detail["error_classification"] = (
-        "transient" if getattr(exc, "is_transient", False) else "permanent"
-    )
-    return detail
-
-
-def _fetch_step_empty_response(
-    correlation_id: str,
-    req_summary: dict,
-    duration_ms: float,
-    *,
-    audit_path: str,
-    start_timestamp: str | None = None,
-    end_timestamp: str | None = None,
-) -> tuple[None, JSONResponse]:
-    """Build (None, error_response) for empty repo; log audit step."""
-    log_audit_step(
-        correlation_id, "fetch_repo_files", "failure",
-        step_index=1, input_summary=req_summary,
-        output_summary={"file_count": 0},
-        error_detail={
-            "message": "Repository is empty or has no readable files",
-            "where": "summary_api.main._run_fetch_step",
-            "error_classification": "permanent",
-        },
-        duration_ms=duration_ms,
-        start_timestamp=start_timestamp,
-        end_timestamp=end_timestamp,
-        audit_path=audit_path,
-    )
-    err_resp = _with_correlation_header(
-        ErrorResponse(status="error", message="Repository is empty or has no readable files").model_dump(),
-        404, correlation_id,
-    )
-    return None, err_resp
-
-
-def _fetch_step_github_error(
-    correlation_id: str,
-    req_summary: dict,
-    e: GitHubClientError,
-    duration_ms: float,
-    *,
-    audit_path: str,
-    dlq_path: str,
-    start_timestamp: str | None = None,
-    end_timestamp: str | None = None,
-) -> tuple[None, JSONResponse]:
-    """Log, DLQ, and return error response for GitHubClientError in fetch step."""
-    err_detail = _error_detail_with_classification(e, "summary_api.clients.github_client.fetch_repo_files")
-    log_audit_step(
-        correlation_id, "fetch_repo_files", "failure",
-        step_index=1, input_summary=req_summary,
-        error_detail=err_detail,
-        duration_ms=duration_ms,
-        start_timestamp=start_timestamp,
-        end_timestamp=end_timestamp,
-        audit_path=audit_path,
-    )
-    write_to_dlq(correlation_id, "fetch_repo_files", request_summary=req_summary, error_detail=err_detail, dlq_path=dlq_path)
-    status, message = _github_error_to_status_and_message(e)
-    return None, _with_correlation_header(
-        ErrorResponse(status="error", message=message).model_dump(), status, correlation_id
-    )
-
-
-def _fetch_step_circuit_error(
-    correlation_id: str,
-    req_summary: dict,
-    e: CircuitBreakerError,
-    duration_ms: float,
-    *,
-    audit_path: str,
-    dlq_path: str,
-    start_timestamp: str | None = None,
-    end_timestamp: str | None = None,
-) -> tuple[None, JSONResponse]:
-    """Log, DLQ, and return 503 for CircuitBreakerError in fetch step."""
-    log_audit_step(
-        correlation_id, "fetch_repo_files", "failure",
-        step_index=1, input_summary=req_summary,
-        error_detail={
-            "message": "Service temporarily unavailable (circuit open)",
-            "where": "summary_api.clients.github_client.fetch_repo_files",
-            "error_classification": "transient",
-        },
-        duration_ms=duration_ms,
-        start_timestamp=start_timestamp,
-        end_timestamp=end_timestamp,
-        audit_path=audit_path,
-    )
-    write_to_dlq(
-        correlation_id, "fetch_repo_files",
-        request_summary=req_summary,
-        error_detail={"message": str(e), "error_classification": "transient"},
-        dlq_path=dlq_path,
-    )
-    return None, _with_correlation_header(
-        ErrorResponse(status="error", message="Service temporarily unavailable. Try again later.").model_dump(),
-        503, correlation_id,
-    )
-
-
-async def _run_fetch_step(
-    correlation_id: str,
-    github_url: str,
-    github_token: str | None,
-    *,
-    audit_path: str,
-    dlq_path: str,
-    github_api_base: str,
-    http_client: httpx.AsyncClient | None = None,
-) -> tuple[list[RepoFile] | None, JSONResponse | None]:
-    """Run fetch_repo_files step; return (files, None) on success or (None, error_response) on failure.
-
-    Why: Keeps summarize() under 20 lines by extracting step logic.
-    What: Awaits async fetch, measures duration, logs audit step; on empty repo or exception returns error.
-
-    Args:
-        correlation_id: Request UUID.
-        github_url: Repo URL from request.
-        github_token: Optional GitHub token from settings.
-        audit_path: Path to audit log (from Settings.AUDIT_LOG_PATH).
-        dlq_path: Path to DLQ file (from Settings.DLQ_PATH).
-        github_api_base: GitHub API base URL (from Settings.GITHUB_API_BASE).
-        http_client: Optional shared HTTP client for connection pooling (R4).
-
-    Returns:
-        (files, None) on success; (None, JSONResponse) on failure (caller should return the response).
-    """
-    start_time = datetime.now(timezone.utc).isoformat()
-    t0 = time.perf_counter()
-    req_summary = {"github_url": github_url, "has_token": bool(github_token)}
-    try:
-        files = await fetch_repo_files(
-            github_url,
-            github_api_base=github_api_base,
-            github_token=github_token,
-            client=http_client,
-        )
-        duration_ms = (time.perf_counter() - t0) * 1000
-        end_time = datetime.now(timezone.utc).isoformat()
-        if not files:
-            return _fetch_step_empty_response(
-                correlation_id, req_summary, duration_ms,
-                audit_path=audit_path,
-                start_timestamp=start_time, end_timestamp=end_time,
-            )
-        log_audit_step(
-            correlation_id, "fetch_repo_files", "success",
-            step_index=1, input_summary=req_summary,
-            output_summary={"file_count": len(files)}, duration_ms=duration_ms,
-            start_timestamp=start_time, end_timestamp=end_time,
-            audit_path=audit_path,
-        )
-        return files, None
-    except GitHubClientError as e:
-        duration_ms = (time.perf_counter() - t0) * 1000
-        end_time = datetime.now(timezone.utc).isoformat()
-        return _fetch_step_github_error(
-            correlation_id, req_summary, e, duration_ms,
-            audit_path=audit_path, dlq_path=dlq_path,
-            start_timestamp=start_time, end_timestamp=end_time,
-        )
-    except CircuitBreakerError as e:
-        duration_ms = (time.perf_counter() - t0) * 1000
-        end_time = datetime.now(timezone.utc).isoformat()
-        return _fetch_step_circuit_error(
-            correlation_id, req_summary, e, duration_ms,
-            audit_path=audit_path, dlq_path=dlq_path,
-            start_timestamp=start_time, end_timestamp=end_time,
-        )
-
-
-def _process_step_failure(
-    correlation_id: str,
-    file_count: int,
-    e: Exception,
-    duration_ms: float,
-    *,
-    audit_path: str,
-    start_timestamp: str | None = None,
-    end_timestamp: str | None = None,
-) -> tuple[None, JSONResponse]:
-    """Log audit failure and return (None, error_response) for process step."""
-    err_detail = {**error_detail_from_exception(e, "summary_api.services.repo_processor.process_repo_files"), "error_classification": "permanent"}
-    log_audit_step(
-        correlation_id, "process_repo_files", "failure",
-        step_index=2, input_summary={"file_count": file_count},
-        error_detail=err_detail,
-        duration_ms=duration_ms,
-        start_timestamp=start_timestamp,
-        end_timestamp=end_timestamp,
-        audit_path=audit_path,
-    )
-    return None, _with_correlation_header(
-        ErrorResponse(status="error", message=str(e)).model_dump(), 500, correlation_id
-    )
-
-
-def _run_process_step(
-    correlation_id: str,
-    files: list[RepoFile],
-    *,
-    audit_path: str,
-) -> tuple[str | None, JSONResponse | None]:
-    """Run process_repo_files step; return (context, None) on success or (None, error_response) on failure.
-
-    Why: Keeps summarize() under 20 lines; process is sync and fast.
-    What: Calls process_repo_files, measures duration, logs audit step.
-
-    Args:
-        correlation_id: Request UUID.
-        files: List of repo files from fetch step.
-        audit_path: Path to audit log (from Settings.AUDIT_LOG_PATH).
-
-    Returns:
-        (context, None) on success; (None, JSONResponse) on failure.
-    """
-    start_time = datetime.now(timezone.utc).isoformat()
-    t0 = time.perf_counter()
-    try:
-        context = process_repo_files(files)
-        duration_ms = (time.perf_counter() - t0) * 1000
-        end_time = datetime.now(timezone.utc).isoformat()
-        log_audit_step(
-            correlation_id, "process_repo_files", "success",
-            step_index=2, input_summary={"file_count": len(files)},
-            output_summary={"context_length": len(context)}, duration_ms=duration_ms,
-            start_timestamp=start_time, end_timestamp=end_time,
-            audit_path=audit_path,
-        )
-        return context, None
-    except Exception as e:
-        duration_ms = (time.perf_counter() - t0) * 1000
-        end_time = datetime.now(timezone.utc).isoformat()
-        return _process_step_failure(
-            correlation_id, len(files), e, duration_ms,
-            audit_path=audit_path,
-            start_timestamp=start_time, end_timestamp=end_time,
-        )
-
-
-def _llm_step_success(
-    correlation_id: str,
-    input_summary: dict,
-    result: dict,
-    duration_ms: float,
-    *,
-    audit_path: str,
-    start_timestamp: str | None = None,
-    end_timestamp: str | None = None,
-) -> tuple[dict, None]:
-    """Log success and return (result, None) for LLM step."""
-    log_audit_step(
-        correlation_id, "summarize_repo", "success",
-        step_index=3, input_summary=input_summary,
-        output_summary={
-            "summary_length": len(result.get("summary", "") or ""),
-            "technologies_count": len(result.get("technologies") or []),
-            "structure_length": len(result.get("structure", "") or ""),
-        },
-        duration_ms=duration_ms,
-        start_timestamp=start_timestamp,
-        end_timestamp=end_timestamp,
-        audit_path=audit_path,
-    )
-    return result, None
-
-
-def _llm_step_llm_error(
-    correlation_id: str,
-    input_summary: dict,
-    context_len: int,
-    provider: str,
-    e: LLMClientError,
-    duration_ms: float,
-    *,
-    audit_path: str,
-    dlq_path: str,
-    start_timestamp: str | None = None,
-    end_timestamp: str | None = None,
-) -> tuple[None, JSONResponse]:
-    """Log, DLQ, and return error response for LLMClientError in LLM step."""
-    err_detail = _error_detail_with_classification(e, "summary_api.clients.llm_client.summarize_repo")
-    log_audit_step(
-        correlation_id, "summarize_repo", "failure",
-        step_index=3, input_summary=input_summary,
-        error_detail=err_detail,
-        duration_ms=duration_ms,
-        start_timestamp=start_timestamp,
-        end_timestamp=end_timestamp,
-        audit_path=audit_path,
-    )
-    write_to_dlq(
-        correlation_id, "summarize_repo",
-        request_summary={"context_length": context_len, "provider": provider},
-        error_detail=err_detail,
-        dlq_path=dlq_path,
-    )
-    status, message = _llm_error_to_status_and_message(e)
-    return None, _with_correlation_header(
-        ErrorResponse(status="error", message=message).model_dump(), status, correlation_id
-    )
-
-
-def _llm_step_circuit_error(
-    correlation_id: str,
-    input_summary: dict,
-    e: CircuitBreakerError,
-    duration_ms: float,
-    *,
-    audit_path: str,
-    dlq_path: str,
-    start_timestamp: str | None = None,
-    end_timestamp: str | None = None,
-) -> tuple[None, JSONResponse]:
-    """Log, DLQ, and return 503 for CircuitBreakerError in LLM step."""
-    log_audit_step(
-        correlation_id, "summarize_repo", "failure",
-        step_index=3, input_summary=input_summary,
-        error_detail={
-            "message": "Service temporarily unavailable (circuit open)",
-            "where": "summary_api.clients.llm_client.summarize_repo",
-            "error_classification": "transient",
-        },
-        duration_ms=duration_ms,
-        start_timestamp=start_timestamp,
-        end_timestamp=end_timestamp,
-        audit_path=audit_path,
-    )
-    write_to_dlq(
-        correlation_id, "summarize_repo",
-        request_summary=input_summary,
-        error_detail={"message": str(e), "error_classification": "transient"},
-        dlq_path=dlq_path,
-    )
-    return None, _with_correlation_header(
-        ErrorResponse(status="error", message="Service temporarily unavailable. Try again later.").model_dump(),
-        503, correlation_id,
-    )
-
-
-async def _run_llm_step(
-    correlation_id: str,
-    context: str,
-    settings: object,
-    *,
-    audit_path: str,
-    dlq_path: str,
-    http_client: httpx.AsyncClient | None = None,
-) -> tuple[dict | None, JSONResponse | None]:
-    """Run summarize_repo (LLM) step; return (result, None) on success or (None, error_response) on failure.
-
-    Why: Keeps summarize() under 20 lines by extracting LLM call and audit.
-    What: Gets provider/key from settings, awaits async summarize_repo, logs audit step; on exception writes DLQ and returns error.
-
-    Args:
-        correlation_id: Request UUID.
-        context: Prepared context from process step.
-        settings: Application Settings.
-        audit_path: Path to audit log (from Settings.AUDIT_LOG_PATH).
-        dlq_path: Path to DLQ file (from Settings.DLQ_PATH).
-        http_client: Optional shared HTTP client for connection pooling (R4).
-
-    Returns:
-        (result_dict, None) on success; (None, JSONResponse) on failure.
-    """
-    start_time = datetime.now(timezone.utc).isoformat()
-    provider, api_key = _get_llm_provider_and_key(settings)
-    t0 = time.perf_counter()
-    input_summary = {"context_length": len(context), "provider": provider}
-    try:
-        result = await summarize_repo(
-            context,
-            api_key=api_key,
-            base_url=settings.NEBIUS_BASE_URL,
-            model=settings.NEBIUS_MODEL,
-            max_tokens=settings.NEBIUS_MAX_TOKENS,
-            client=http_client,
-        )
-        duration_ms = (time.perf_counter() - t0) * 1000
-        end_time = datetime.now(timezone.utc).isoformat()
-        return _llm_step_success(
-            correlation_id, input_summary, result, duration_ms,
-            audit_path=audit_path,
-            start_timestamp=start_time, end_timestamp=end_time,
-        )
-    except LLMClientError as e:
-        duration_ms = (time.perf_counter() - t0) * 1000
-        end_time = datetime.now(timezone.utc).isoformat()
-        return _llm_step_llm_error(
-            correlation_id, input_summary, len(context), provider, e, duration_ms,
-            audit_path=audit_path, dlq_path=dlq_path,
-            start_timestamp=start_time, end_timestamp=end_time,
-        )
-    except CircuitBreakerError as e:
-        duration_ms = (time.perf_counter() - t0) * 1000
-        end_time = datetime.now(timezone.utc).isoformat()
-        return _llm_step_circuit_error(
-            correlation_id, input_summary, e, duration_ms,
-            audit_path=audit_path, dlq_path=dlq_path,
-            start_timestamp=start_time, end_timestamp=end_time,
-        )
 
 
 def _build_success_response(result: dict, correlation_id: str) -> Response:
@@ -769,9 +241,9 @@ def health_ready() -> dict | JSONResponse:
 
 @app.get("/")
 def root() -> dict[str, str]:
-    """Root route: point to the summarize endpoint and API docs."""
+    """Root route: point to summarize/scan endpoints and API docs."""
     return {
-        "message": "Summary API. Use POST /summarize with {\"github_url\": \"https://github.com/owner/repo\"}",
+        "message": "Summary API. POST /summarize or POST /scan with {\"github_url\": \"https://github.com/owner/repo\"}",
         "docs": "/docs",
     }
 
@@ -780,41 +252,170 @@ def root() -> dict[str, str]:
 async def summarize(
     payload: SummarizeRequest, response: Response, request: Request
 ) -> SummarizeResponse | JSONResponse:
-    """Full flow: fetch repo → process context → LLM summarize → return JSON per spec.
+    """Full flow: LangGraph workflow fetch → process → summarize (PydanticAI in summarize node).
 
-    Why: Single entrypoint for the summarize API; delegates to step helpers for clarity and rule compliance (max 20 lines).
-    What: Runs fetch, process, LLM steps in order; on any failure returns error response; on success audits and returns SummarizeResponse.
+    Why: Single entrypoint; workflow and nodes implement langgraph-architecture-and-nodes and agentic-logic-and-tools.
+    What: Builds initial state, invokes compiled graph, returns error response or SummarizeResponse per API spec.
     """
     correlation_id = str(uuid.uuid4())
     settings = get_settings()
-    audit_path = settings.AUDIT_LOG_PATH
-    dlq_path = settings.DLQ_PATH
-    github_token = settings.GITHUB_TOKEN.get_secret_value() or None
-    http_client = getattr(request.app.state, "http_client", None)
-
-    files, err = await _run_fetch_step(
-        correlation_id, payload.github_url, github_token,
-        audit_path=audit_path, dlq_path=dlq_path,
-        github_api_base=settings.GITHUB_API_BASE,
-        http_client=http_client,
-    )
-    if err is not None:
-        _audit(payload.github_url, correlation_id, "failure", err.status_code, None, audit_path=audit_path)
-        return err
-
-    context, err = _run_process_step(correlation_id, files, audit_path=audit_path)
-    if err is not None:
-        _audit(payload.github_url, correlation_id, "failure", err.status_code, None, audit_path=audit_path)
-        return err
-
-    result, err = await _run_llm_step(
-        correlation_id, context, settings,
-        audit_path=audit_path, dlq_path=dlq_path,
-        http_client=http_client,
-    )
-    if err is not None:
-        _audit(payload.github_url, correlation_id, "failure", err.status_code, None, audit_path=audit_path)
-        return err
-
-    _audit(payload.github_url, correlation_id, "success", 200, audit_path=audit_path)
+    nebius_key = (settings.NEBIUS_API_KEY.get_secret_value() or "").strip()
+    initial_state: dict = {
+        "correlation_id": correlation_id,
+        "github_url": payload.github_url,
+        "github_token": settings.GITHUB_TOKEN.get_secret_value() or None,
+        "github_api_base": settings.GITHUB_API_BASE,
+        "audit_path": settings.AUDIT_LOG_PATH,
+        "dlq_path": settings.DLQ_PATH,
+        "max_context_chars": settings.MAX_CONTEXT_CHARS,
+        "context_limit_tokens": settings.CONTEXT_LIMIT_TOKENS,
+        "nebius_api_key": nebius_key,
+        "nebius_base_url": settings.NEBIUS_BASE_URL,
+        "nebius_model": settings.NEBIUS_MODEL,
+        "nebius_max_tokens": settings.NEBIUS_MAX_TOKENS,
+        "http_client": getattr(request.app.state, "http_client", None),
+        "errors": [],
+    }
+    graph = get_summarize_graph()
+    final_state = await graph.ainvoke(initial_state)
+    err_resp = final_state.get("error_response")
+    if err_resp:
+        status_code = err_resp.get("status_code", 502)
+        _audit(payload.github_url, correlation_id, "failure", status_code, None, audit_path=settings.AUDIT_LOG_PATH)
+        return JSONResponse(
+            status_code=status_code,
+            content=err_resp.get("content", {}),
+            headers={"X-Correlation-ID": err_resp.get("correlation_id", correlation_id)},
+        )
+    result = final_state.get("result")
+    if not result:
+        _audit(payload.github_url, correlation_id, "failure", 502, None, audit_path=settings.AUDIT_LOG_PATH)
+        return JSONResponse(
+            status_code=502,
+            content=ErrorResponse(status="error", message="No result from summarize step").model_dump(),
+            headers={"X-Correlation-ID": correlation_id},
+        )
+    _audit(payload.github_url, correlation_id, "success", 200, audit_path=settings.AUDIT_LOG_PATH)
     return _build_success_response(result, correlation_id)
+
+
+@app.post("/scan")
+async def scan(
+    payload: ScanRequest, response: Response, request: Request
+) -> JSONResponse:
+    """Security scan: fetch → process → planner → orchestrator → workers → md_writer → synthesizer.
+    Returns only report_path to the saved Markdown report.
+    """
+    # #region agent log
+    try:
+        with open("debug-c3392b.log", "a", encoding="utf-8") as _f:
+            _f.write(json.dumps({"sessionId": "c3392b", "id": "log_scan_start", "timestamp": int(time.time() * 1000), "location": "main.py:scan", "message": "scan_start", "data": {"correlation_id": str(uuid.uuid4())}, "hypothesisId": "H5"}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # #endregion
+    correlation_id = str(uuid.uuid4())
+    settings = get_settings()
+    nebius_key = (settings.NEBIUS_API_KEY.get_secret_value() or "").strip()
+    md_queue: asyncio.Queue = asyncio.Queue()
+    initial_state: dict = {
+        "correlation_id": correlation_id,
+        "github_url": payload.github_url,
+        "github_token": settings.GITHUB_TOKEN.get_secret_value() or None,
+        "github_api_base": settings.GITHUB_API_BASE,
+        "audit_path": settings.AUDIT_LOG_PATH,
+        "dlq_path": settings.DLQ_PATH,
+        "max_context_chars": settings.MAX_CONTEXT_CHARS,
+        "context_limit_tokens": settings.CONTEXT_LIMIT_TOKENS,
+        "scan_goal": "Scan repository for security vulnerabilities",
+        "scan_reports_dir": settings.SCAN_REPORTS_DIR,
+        "nebius_api_key": nebius_key,
+        "nebius_base_url": settings.NEBIUS_BASE_URL,
+        "nebius_model": settings.NEBIUS_MODEL,
+        "nebius_max_tokens": settings.NEBIUS_MAX_TOKENS,
+        "http_client": getattr(request.app.state, "http_client", None),
+        "errors": [],
+        "md_queue": md_queue,
+    }
+    try:
+        graph = get_scan_graph()
+        # #region agent log
+        try:
+            with open("debug-c3392b.log", "a", encoding="utf-8") as _f:
+                _f.write(json.dumps({"sessionId": "c3392b", "id": "log_graph_ok", "timestamp": int(time.time() * 1000), "location": "main.py:scan", "message": "get_scan_graph_ok", "data": {}, "hypothesisId": "H5"}, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        final_state = await graph.ainvoke(initial_state)
+        # #region agent log
+        try:
+            with open("debug-c3392b.log", "a", encoding="utf-8") as _f:
+                _f.write(json.dumps({"sessionId": "c3392b", "id": "log_ainvoke_done", "timestamp": int(time.time() * 1000), "location": "main.py:scan", "message": "ainvoke_done", "data": {}, "hypothesisId": "H2"}, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+        # #endregion
+    except Exception as e:
+        # #region agent log
+        try:
+            with open("debug-c3392b.log", "a", encoding="utf-8") as _f:
+                _f.write(json.dumps({"sessionId": "c3392b", "id": "log_scan_exception", "timestamp": int(time.time() * 1000), "location": "main.py:scan", "message": "exception", "data": {"type": type(e).__name__, "msg": str(e), "tb": traceback.format_exc()}, "hypothesisId": "H1"}, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        raise
+    err_resp = final_state.get("error_response")
+    if err_resp:
+        status_code = err_resp.get("status_code", 502)
+        try:
+            log_audit(
+                event_type="api_request",
+                resource="/scan",
+                action="POST",
+                result="failure",
+                correlation_id=correlation_id,
+                metadata={"github_url": payload.github_url, "status_code": status_code},
+                audit_path=settings.AUDIT_LOG_PATH,
+            )
+        except Exception:
+            pass
+        return JSONResponse(
+            status_code=status_code,
+            content=err_resp.get("content", {}),
+            headers={"X-Correlation-ID": err_resp.get("correlation_id", correlation_id)},
+        )
+    result = final_state.get("result") or {}
+    report_path = result.get("report_path", "")
+    if not report_path:
+        try:
+            log_audit(
+                event_type="api_request",
+                resource="/scan",
+                action="POST",
+                result="failure",
+                correlation_id=correlation_id,
+                metadata={"github_url": payload.github_url, "status_code": 502},
+                audit_path=settings.AUDIT_LOG_PATH,
+            )
+        except Exception:
+            pass
+        return JSONResponse(
+            status_code=502,
+            content=ErrorResponse(status="error", message="No report_path from scan").model_dump(),
+            headers={"X-Correlation-ID": correlation_id},
+        )
+    try:
+        log_audit(
+            event_type="api_request",
+            resource="/scan",
+            action="POST",
+            result="success",
+            correlation_id=correlation_id,
+            metadata={"github_url": payload.github_url, "status_code": 200, "report_path": report_path},
+            audit_path=settings.AUDIT_LOG_PATH,
+        )
+    except Exception:
+        pass
+    return JSONResponse(
+        status_code=200,
+        content={"report_path": report_path},
+        headers={"X-Correlation-ID": correlation_id},
+    )

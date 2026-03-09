@@ -1,4 +1,7 @@
-"""Repository processor: filter files, prioritize content, and build a single context string for the LLM."""
+"""Repository processor: filter files, prioritize content, and build a single context string for the LLM.
+
+Implements ContextBuilder contract for swappable context-building implementations.
+"""
 
 from __future__ import annotations
 
@@ -6,11 +9,17 @@ import re
 from typing import Sequence
 
 from summary_api.clients.github_client import RepoFile
+from summary_api.contracts import ContextBuilder
 
 # Default context size: ~60k chars leaves room for prompt + response in typical 8k–32k context windows.
 # Note: process_repo_files is currently synchronous. For very large repos (thousands of files),
 # core-python-standards recommends evaluating ProcessPoolExecutor for CPU-bound batch processing.
 DEFAULT_MAX_CONTEXT_CHARS = 60_000
+
+# Module-level cache for loaded data (e.g. DataFrames) per agentic-logic-and-tools: reduces token usage
+# (refer by reference), improves performance (RAM vs disk), keeps a clean interface (no cache passed everywhere).
+# When adding heavy loaded data, store it here keyed by a stable identifier.
+_DATA_CACHE: dict[str, object] = {}
 
 # Directory names we skip (case-insensitive).
 SKIP_DIRS = frozenset({
@@ -41,6 +50,10 @@ PRIORITY_CONFIG_NAMES = frozenset({
     "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
     "tsconfig.json", "webpack.config.js", "CMakeLists.txt",
 })
+
+
+# Internal helpers below have no formal interface per contract-scope-and-boundaries
+# (replaceability not required; avoid over-engineering).
 
 
 def _path_segments(path: str) -> list[str]:
@@ -192,3 +205,15 @@ def process_repo_files(
     if not filtered:
         return "Repository has no included text files (all skipped or empty)."
     return _build_context_sections(filtered, max_chars)
+
+
+class RepoContextBuilder(ContextBuilder):
+    """ContextBuilder implementation: filter, prioritize, merge repo files for LLM context."""
+
+    def build_context(
+        self,
+        files: Sequence[RepoFile],
+        max_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+    ) -> str:
+        """Build context string from repo files; implements ContextBuilder contract."""
+        return process_repo_files(files, max_chars=max_chars)

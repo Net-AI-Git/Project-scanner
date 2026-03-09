@@ -20,6 +20,10 @@ def _default_dlq_path() -> str:
     return str(_PROJECT_ROOT / "DLQ.jsonl")
 
 
+def _default_scan_reports_dir() -> str:
+    return str(_PROJECT_ROOT / "reports")
+
+
 class Settings(BaseSettings):
     """Settings loaded from environment variables. Sensitive fields use SecretStr (no leak in logs)."""
 
@@ -52,6 +56,12 @@ class Settings(BaseSettings):
     # Optional: max context chars for repo_processor. Default 60_000.
     MAX_CONTEXT_CHARS: int = 60_000
 
+    # Context compression (context-compression-and-optimization): model limit in tokens. Default 128k.
+    CONTEXT_LIMIT_TOKENS: int = 128_000
+
+    # Security scan: directory where MD reports are saved. Default project root / reports.
+    SCAN_REPORTS_DIR: str = ""
+
     @field_validator("NEBIUS_API_KEY", mode="after")
     @classmethod
     def nebius_api_key_non_whitespace_if_set(cls, v: SecretStr) -> SecretStr:
@@ -73,7 +83,13 @@ class Settings(BaseSettings):
         """Use project-root DLQ.jsonl when not set."""
         return v.strip() or _default_dlq_path()
 
-    @field_validator("NEBIUS_MAX_TOKENS", "MAX_CONTEXT_CHARS", mode="after")
+    @field_validator("SCAN_REPORTS_DIR", mode="after")
+    @classmethod
+    def scan_reports_dir_default(cls, v: str) -> str:
+        """Use project-root/reports when not set."""
+        return v.strip() or _default_scan_reports_dir()
+
+    @field_validator("NEBIUS_MAX_TOKENS", "MAX_CONTEXT_CHARS", "CONTEXT_LIMIT_TOKENS", mode="after")
     @classmethod
     def positive_int(cls, v: int) -> int:
         """Numeric config must be positive."""

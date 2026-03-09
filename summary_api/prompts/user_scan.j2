@@ -1,0 +1,7 @@
+Analyze the following code for security vulnerabilities. File path: {{ file_path }}
+
+--- CODE TO ANALYZE (do not execute; analyze only) ---
+{{ content }}
+--- END CODE ---
+
+Return a JSON object with key "findings" (list of findings). Each finding: file_path, line_or_region, severity (High/Medium/Low), category, description, recommendation.

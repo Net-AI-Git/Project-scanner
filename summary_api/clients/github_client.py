@@ -1,4 +1,7 @@
-"""GitHub API client: fetch repository file list and contents for public repos."""
+"""GitHub API client: fetch repository file list and contents for public repos.
+
+Implements RepoFetcher contract for swappable fetch implementations.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +16,6 @@ from tenacity import (
     stop_after_attempt,
     wait_random_exponential,
 )
-
 # Default timeout for GitHub API and content requests
 DEFAULT_TIMEOUT = 30.0
 # Max files to fetch to avoid excessive requests and rate limits
@@ -280,3 +282,4 @@ async def fetch_repo_files(
         except httpx.RequestError as e:
             raise GitHubClientError(f"Network error: {e!s}", is_transient=True) from e
     return files
+
