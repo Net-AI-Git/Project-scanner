@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Debug Summary API flow — fixed REPO.
-Runs the same flow as POST /summarize on https://github.com/Net-AI-Git/Project-scanner,
-logging each step: what is fetched, what is filtered, which files are sent to the LLM and in what order, and the metrics.
+Debug scan flow (fetch + process) — fixed REPO.
+Runs fetch and context build for https://github.com/Net-AI-Git/Project-scanner,
+logging what is fetched, filtered, and the context sent to downstream (e.g. scan).
 
 Run from project root with venv activated:
-  python scripts/debug_repo_flow.py         — full flow including LLM call (requires NEBIUS_API_KEY)
-  python scripts/debug_repo_flow.py --no-llm  — no LLM; stop after building context
+  python scripts/debug_repo_flow.py
 """
 
 from __future__ import annotations
@@ -202,66 +201,23 @@ def step4_context(files: list):
     logger.info("-" * 40)
     logger.info("%s", preview)
     logger.info("-" * 40)
-    from summary_api.clients.llm_client import render_user_prompt_preview
-    user_preview = render_user_prompt_preview()
-    logger.info("  LLM prompt structure:")
-    logger.info("    system: (role + JSON format)")
-    logger.info("    user: %s...", user_preview.strip()[:80])
-    logger.info("    Inside user: the context built above (%s chars).", len(context))
     logger.info("")
     return context
-
-
-# ---------------------------------------------------------------------------
-# Step 5: LLM call (optional)
-# ---------------------------------------------------------------------------
-def step5_llm(context: str):
-    from summary_api.core.config import get_settings
-    from summary_api.clients.llm_client import summarize_repo, LLMClientError
-
-    logger.info("\n" + "=" * 70)
-    logger.info("Step 5: LLM call (Nebius Token Factory)")
-    logger.info("=" * 70)
-    settings = get_settings()
-    api_key = (settings.NEBIUS_API_KEY.get_secret_value() or "").strip()
-    if not api_key:
-        logger.info("  Skipped: NEBIUS_API_KEY not set. Use .env or set the env var.")
-        return
-    logger.info("  Sending context + system/user prompt; waiting for JSON (summary, technologies, structure).")
-    logger.info("")
-    try:
-        result = asyncio.run(
-            summarize_repo(
-                context,
-                api_key=api_key,
-                base_url=settings.NEBIUS_BASE_URL,
-                model=settings.NEBIUS_MODEL,
-                max_tokens=settings.NEBIUS_MAX_TOKENS,
-            )
-        )
-        logger.info("  Success.")
-        logger.info("  summary: %s...", (result.get("summary", "") or "")[:300])
-        logger.info("  technologies: %s", result.get("technologies", []))
-        logger.info("  structure: %s...", (result.get("structure", "") or "")[:300])
-    except LLMClientError as e:
-        logger.info("  Error: %s", e.message)
-    logger.info("")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Debug Summary API flow on a fixed REPO")
-    parser.add_argument("--no-llm", action="store_true", help="Do not call the LLM; stop after building context")
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description="Debug scan flow: fetch, filter, and build context for a fixed REPO")
+    parser.parse_args()
 
     from summary_api.core.config import get_settings
 
     settings = get_settings()
     github_token = (settings.GITHUB_TOKEN.get_secret_value() or "").strip() or None
 
-    logger.info("*** Debug Summary API flow — fixed REPO: %s ***", FIXED_REPO_URL)
+    logger.info("*** Debug flow (fetch + process) — fixed REPO: %s ***", FIXED_REPO_URL)
 
     step0_params()
     files = step1_fetch(FIXED_REPO_URL, github_token, settings.GITHUB_API_BASE)
@@ -273,12 +229,7 @@ def main() -> int:
         logger.info("No files after filter — exiting.")
         return 1
     step3_priorities(kept)
-    context = step4_context(kept)
-    if not args.no_llm:
-        step5_llm(context)
-    else:
-        logger.info("(Skipping step 5 — --no-llm passed)")
-
+    step4_context(kept)
     return 0
 
 

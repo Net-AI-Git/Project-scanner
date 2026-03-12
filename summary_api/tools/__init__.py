@@ -1,8 +1,3 @@
-"""LangChain-style tools for agent use.
+"""LangChain-style tools for agent use (when needed)."""
 
-Implements: .cursor/rules/agents/agentic-logic-and-tools (Tool Definition, deep documentation).
-"""
-
-from summary_api.tools.summarize import get_summarize_repo_context_tool
-
-__all__ = ["get_summarize_repo_context_tool"]
+__all__: list[str] = []

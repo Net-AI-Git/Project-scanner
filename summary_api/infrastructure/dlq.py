@@ -22,7 +22,7 @@ def write_to_dlq(
 
     Args:
         correlation_id: Request/session UUID for traceability.
-        step_name: Step that failed (e.g. fetch_repo_files, summarize_repo).
+        step_name: Step that failed (e.g. fetch_repo_files, scan_workers).
         request_summary: Sanitized request info (e.g. github_url; no secrets).
         error_detail: Error message, where, traceback, error_classification.
         dlq_path: Path to DLQ file. Caller must pass from Settings.DLQ_PATH (get_settings().DLQ_PATH).

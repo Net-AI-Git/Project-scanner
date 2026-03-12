@@ -62,6 +62,14 @@ class Settings(BaseSettings):
     # Security scan: directory where MD reports are saved. Default project root / reports.
     SCAN_REPORTS_DIR: str = ""
 
+    # LangSmith observability (optional). When set, LangGraph/LangChain send traces to LangSmith.
+    # See https://docs.smith.langchain.com/ — do not log LANGCHAIN_API_KEY.
+    LANGCHAIN_TRACING_V2: str = "false"
+    LANGCHAIN_API_KEY: SecretStr = SecretStr("")
+    LANGCHAIN_PROJECT: str = "summary-api"
+    # Required for EU region (eu.smith.langchain.com). Set to https://eu.api.smith.langchain.com
+    LANGSMITH_ENDPOINT: str = ""
+
     @field_validator("NEBIUS_API_KEY", mode="after")
     @classmethod
     def nebius_api_key_non_whitespace_if_set(cls, v: SecretStr) -> SecretStr:

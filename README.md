@@ -1,8 +1,6 @@
-# Summary API — Nebius Academy Task
+# Scan API
 
-A small API service that accepts a public GitHub repository URL and returns a human-readable summary: what the project does, which technologies it uses, and how it is structured. Built with FastAPI; uses GitHub API for repo contents and Nebius Token Factory for the LLM summary.
-
-This README provides the **step-by-step setup and run instructions**, **model choice and rationale**, and **repository processing approach** required for submission (AI Performance Engineering 2026).
+An API service that accepts a public GitHub repository URL and runs a **security vulnerability scan**, returning a Markdown report path. Built with FastAPI; uses GitHub API for repo contents and Nebius Token Factory (LLM) for the scan workflow (planner, workers, synthesizer).
 
 ---
 
@@ -58,7 +56,7 @@ This README provides the **step-by-step setup and run instructions**, **model ch
    ```
    Restart the server after changing `.env`.
 
-5. **Run the server** — from the **project root** (see [Run the server](#run-the-server) for the command). After it starts, the `POST /summarize` endpoint is available at `http://localhost:8000/summarize`, and health probes at `GET /health/live` and `GET /health/ready`.
+5. **Run the server** — from the **project root** (see [Run the server](#run-the-server) for the command). After it starts, the `POST /scan` endpoint is available at `http://localhost:8000/scan`, and health probes at `GET /health/live` and `GET /health/ready`.
 
 ---
 
@@ -80,7 +78,7 @@ uv run uvicorn summary_api.main:app --host 0.0.0.0 --port 8000 --workers 4
 
 Adjust the `--workers` value (e.g. 4) per environment and load. After the server starts:
 
-- **POST /summarize** — main endpoint for repo summarization.
+- **POST /scan** — main endpoint for security scan (returns `report_path` to the saved Markdown report).
 - **GET /health/live** — liveness probe (e.g. for Kubernetes).
 - **GET /health/ready** — readiness probe (cached ~5s).
 
@@ -88,52 +86,25 @@ Adjust the `--workers` value (e.g. 4) per environment and load. After the server
 
 ## Test the endpoint
 
-As in the task specification, you can test with:
-
 ```bash
-curl -X POST http://localhost:8000/summarize \
+curl -X POST http://localhost:8000/scan \
   -H "Content-Type: application/json" \
   -d '{"github_url": "https://github.com/psf/requests"}'
 ```
 
-You should get HTTP 200 and a JSON body with `summary`, `technologies`, and `structure`.
+You should get HTTP 200 and a JSON body with `report_path` (path to the generated Markdown report).
 
 **PowerShell (alternative):**
 
 ```powershell
-(Invoke-WebRequest -Method Post -Uri "http://localhost:8000/summarize" -ContentType "application/json" -Body '{"github_url": "https://github.com/psf/requests"}' -UseBasicParsing).Content
+(Invoke-WebRequest -Method Post -Uri "http://localhost:8000/scan" -ContentType "application/json" -Body '{"github_url": "https://github.com/psf/requests"}' -UseBasicParsing).Content
 ```
 
 ---
 
-## Model choice
+## Scan workflow
 
-**Nebius Token Factory** with **Llama-3.3-70B-Instruct** — chosen for good quality and structured output for repo summarization; the API is OpenAI-compatible and keys are available from Nebius. The prompt asks the LLM for a single JSON object with `summary`, `technologies`, and `structure`; the response is parsed (with a fallback for plain text) so the API always returns the specified format.
-
----
-
-## Repository processing (what we include, what we skip, and why)
-
-The service does **not** send the whole repo to the LLM. It filters and prioritizes content and enforces a **context size limit** (~60k characters by default) so we stay within typical context windows.
-
-### What we skip (and why)
-
-- **Directories:** `node_modules`, `__pycache__`, `.git`, `venv`, `.venv`, `dist`, `build`, `.eggs`, `.tox`, cache dirs (e.g. `.pytest_cache`, `.mypy_cache`), `vendor`, `pods`, IDE folders (`.idea`, `.vscode`), coverage output, etc.  
-  **Why:** Generated or tooling artifacts; not useful for "what does this project do."
-- **Files:** Lock files (`package-lock.json`, `yarn.lock`, `poetry.lock`, `Cargo.lock`, etc.), minified files (`.min.js`, `.min.css`), source maps (`.map`).  
-  **Why:** Lock files are large and low signal; minified/map files are not human-readable.
-
-Binary detection is not exhaustive; the focus is on skipping the above and on size/priority limits.
-
-### What we include (and in what order)
-
-1. **Repository structure** — A compact directory tree (paths only) so the LLM sees layout.
-2. **High priority:** README-style files (e.g. `README`, `CONTRIBUTING`, `CHANGELOG`), `LICENSE`, and key config files (`package.json`, `pyproject.toml`, `requirements.txt`, `setup.py`, `Cargo.toml`, `go.mod`, `Dockerfile`, `Makefile`, `tsconfig.json`, etc.).
-3. **Other files** — Sorted by depth and type; root and shallow files come before deep ones.
-
-Single files are truncated if they are very large; total context is capped so the request does not exceed the limit. If the repo is huge, lower-priority content is dropped and a short "omitted due to context limit" note is added.
-
-This keeps the prompt small enough for the model while giving it README, structure, and config so it can summarize purpose, technologies, and layout.
+The scan uses a LangGraph workflow: **fetch** (GitHub) → **process** (filter/prioritize context) → **planner** → **orchestrator** → **workers** (per-file vulnerability scan via LLM) → **md_writer** → **synthesizer**. The LLM (Nebius Token Factory, Llama-3.3-70B-Instruct) is used for planning and for analyzing file content for security findings.
 
 ---
 
@@ -151,8 +122,25 @@ Examples: invalid or non-GitHub URL (400), repo not found or private (404), LLM 
 
 ## Infrastructure and observability
 
-- **Logging:** Logs are emitted as JSON to stdout when `LOG_FORMAT=json`; audit and DLQ write to `AUDIT.jsonl` and `DLQ.jsonl` for local or external collection. **Splunk HEC ingestion is currently out of scope**; add a HEC sink in your log pipeline if you use Splunk.
+- **Logging:** Logs are emitted as JSON to stdout when `LOG_FORMAT=json`; audit and DLQ write to `AUDIT.jsonl` and `DLQ.jsonl` for local or external collection.
 - **Tenancy:** The service is **single-tenant**. For multi-tenant deployments, apply `tenant_id` and isolation per the multi-tenancy rule.
+
+### LangSmith observability (optional)
+
+The app can send **traces and metrics** for LangGraph/LLM runs to [LangSmith](https://smith.langchain.com/) when configured. Audit logs remain in `AUDIT.jsonl`; LangSmith is used only for traces and agent/LLM observability.
+
+**Environment variables** (copy into `.env` or set in the environment):
+
+| Variable | Description |
+|----------|-------------|
+| `LANGCHAIN_TRACING_V2` | Set to `true` to enable tracing (default: `false`). |
+| `LANGCHAIN_API_KEY` | Your LangSmith API key (get it at [smith.langchain.com](https://smith.langchain.com/) or [eu.smith.langchain.com](https://eu.smith.langchain.com) for EU). Not logged. |
+| `LANGCHAIN_PROJECT` | Project name in LangSmith (default: `summary-api`). |
+| `LANGSMITH_ENDPOINT` | **Required for EU region.** Set to `https://eu.api.smith.langchain.com` if your project is on [eu.smith.langchain.com](https://eu.smith.langchain.com). Omit for US. |
+
+**Where to see data:** In the [LangSmith dashboard](https://smith.langchain.com/) (or [EU](https://eu.smith.langchain.com/)), open your project to view runs, latency, errors, and token usage. Each request is associated with a `correlation_id` in run metadata so you can correlate traces with logs and audit.
+
+**Alerts:** In LangSmith you can configure alerts (e.g. errored runs, latency thresholds) and notifications (e.g. webhooks, PagerDuty). See [LangSmith Alerts](https://docs.langchain.com/langsmith/alerts).
 
 ---
 
@@ -160,13 +148,13 @@ Examples: invalid or non-GitHub URL (400), repo not found or private (404), LLM 
 
 ```
 summary_api/
-├── main.py          # FastAPI app, POST /summarize, error handling
-├── config.py        # Settings from env (no keys in code)
-├── schemas.py       # Pydantic: request/response/error
-├── github_client.py # Fetch repo file list and contents from GitHub API
-├── repo_processor.py# Filter, prioritize, and build context for the LLM
-├── llm_client.py    # Call Nebius Token Factory, parse summary JSON
-└── audit.py         # Audit logging for requests and errors
+├── api/main.py      # FastAPI app, POST /scan, error handling
+├── core/config.py   # Settings from env (no keys in code)
+├── models/schemas.py# Pydantic: ScanRequest, ErrorResponse, Finding, etc.
+├── workflows/       # LangGraph: graph, nodes (fetch, process), scan_nodes
+├── clients/         # GitHub fetcher; llm_client (LLMClientError only)
+├── services/        # repo_processor, planner, vulnerability_scanner, report_synthesizer
+└── core/audit.py    # Audit logging for requests and errors
 ```
 
 Dependencies are managed with **UV**: see `pyproject.toml` and `uv.lock` in the project root. Use `uv sync` to install (see setup steps above).

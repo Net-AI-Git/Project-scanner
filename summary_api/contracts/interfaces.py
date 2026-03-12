@@ -1,7 +1,7 @@
 """Abstract base classes for agent component boundaries.
 
 Implements: .cursor/rules/agents/agent-component-interfaces.
-Use at boundary points where implementations may be swapped (fetcher, processor, summarizer).
+Use at boundary points where implementations may be swapped (fetcher, processor).
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from typing import Sequence
 import httpx
 
 from summary_api.clients.github_client import RepoFile
-from summary_api.models.schemas import SectionFindings, SummarizeResponse
+from summary_api.models.schemas import SectionFindings
 
 
 class RepoFetcher(ABC):
@@ -78,46 +78,6 @@ class ContextBuilder(ABC):
 
         Returns:
             Single string: directory tree and key file contents, truncated to max_chars.
-        """
-        ...
-
-
-class Summarizer(ABC):
-    """Contract for summarizing repository context via LLM.
-
-    Implementations use PydanticAI or other agents; return validated SummarizeResponse.
-    Input: context string and LLM config. Output: SummarizeResponse.
-    Exceptions: Implementation-specific (e.g. LLMClientError).
-    Side effects: Network I/O to LLM API.
-    """
-
-    @abstractmethod
-    async def summarize(
-        self,
-        context: str,
-        *,
-        api_key: str,
-        base_url: str,
-        model: str,
-        max_tokens: int = 4096,
-        timeout: float = 120.0,
-    ) -> SummarizeResponse:
-        """Summarize repository context and return structured response.
-
-        Args:
-            context: Prepared repo context string from ContextBuilder.
-            api_key: LLM API key.
-            base_url: LLM API base URL.
-            model: Model identifier.
-            max_tokens: Max tokens to generate.
-            timeout: Request timeout in seconds.
-
-        Returns:
-            Validated SummarizeResponse (summary, technologies, structure).
-
-        Raises:
-            Implementation-specific exception (e.g. LLMClientError) on auth failure,
-            rate limit, timeout, or invalid response.
         """
         ...
 

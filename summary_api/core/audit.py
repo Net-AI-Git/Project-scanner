@@ -126,7 +126,7 @@ def log_audit_step(
 
     Args:
         correlation_id: Request/session UUID.
-        step_name: Logical step (e.g. fetch_repo_files, process_repo_files, summarize_repo).
+        step_name: Logical step (e.g. fetch_repo_files, process_repo_files, scan_workers).
         result: "success" or "failure".
         step_index: Optional 1-based step order in the flow.
         input_summary: Sanitized input summary (no secrets); e.g. {"github_url": "...", "file_count": 0}.
