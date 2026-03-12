@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import time
-import traceback
 import uuid
 from contextlib import asynccontextmanager
 
@@ -306,13 +305,6 @@ async def scan(
     """Security scan: fetch → process → planner → orchestrator → workers → md_writer → synthesizer.
     Returns only report_path to the saved Markdown report.
     """
-    # #region agent log
-    try:
-        with open("debug-c3392b.log", "a", encoding="utf-8") as _f:
-            _f.write(json.dumps({"sessionId": "c3392b", "id": "log_scan_start", "timestamp": int(time.time() * 1000), "location": "main.py:scan", "message": "scan_start", "data": {"correlation_id": str(uuid.uuid4())}, "hypothesisId": "H5"}, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-    # #endregion
     correlation_id = str(uuid.uuid4())
     settings = get_settings()
     nebius_key = (settings.NEBIUS_API_KEY.get_secret_value() or "").strip()
@@ -336,32 +328,8 @@ async def scan(
         "errors": [],
         "md_queue": md_queue,
     }
-    try:
-        graph = get_scan_graph()
-        # #region agent log
-        try:
-            with open("debug-c3392b.log", "a", encoding="utf-8") as _f:
-                _f.write(json.dumps({"sessionId": "c3392b", "id": "log_graph_ok", "timestamp": int(time.time() * 1000), "location": "main.py:scan", "message": "get_scan_graph_ok", "data": {}, "hypothesisId": "H5"}, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
-        # #endregion
-        final_state = await graph.ainvoke(initial_state)
-        # #region agent log
-        try:
-            with open("debug-c3392b.log", "a", encoding="utf-8") as _f:
-                _f.write(json.dumps({"sessionId": "c3392b", "id": "log_ainvoke_done", "timestamp": int(time.time() * 1000), "location": "main.py:scan", "message": "ainvoke_done", "data": {}, "hypothesisId": "H2"}, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
-        # #endregion
-    except Exception as e:
-        # #region agent log
-        try:
-            with open("debug-c3392b.log", "a", encoding="utf-8") as _f:
-                _f.write(json.dumps({"sessionId": "c3392b", "id": "log_scan_exception", "timestamp": int(time.time() * 1000), "location": "main.py:scan", "message": "exception", "data": {"type": type(e).__name__, "msg": str(e), "tb": traceback.format_exc()}, "hypothesisId": "H1"}, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
-        # #endregion
-        raise
+    graph = get_scan_graph()
+    final_state = await graph.ainvoke(initial_state)
     err_resp = final_state.get("error_response")
     if err_resp:
         status_code = err_resp.get("status_code", 502)
